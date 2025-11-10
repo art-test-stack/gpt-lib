@@ -16,7 +16,7 @@
 <h3 align="center">Small Language Model</h3>
 
   <p align="center">
-    This project is the implementation of a little GPT model trained on different datasets
+    This project is the implementation of a little GPT model trained on different datasets. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotly.
     <br />
     <a href="https://github.com/art-test-stack/my-gpt"><strong>Explore the docs »</strong></a>
     <br />
@@ -24,34 +24,6 @@
     <a href="https://github.com/art-test-stack/my-gpt/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
   </p>
 </div>
-
-
-
-<!-- TABLE OF CONTENTS -->
-<!-- <details>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li>
-      <a href="#about-the-project">About The Project</a>
-      <ul>
-        <li><a href="#the-implementation">The implementation</a></li>
-        <li><a href="#built-with">Built With</a></li>
-      </ul>
-    </li>
-    <li>
-      <a href="#getting-started">Getting Started</a>
-      <ul>
-        <li><a href="#installation">Installation</a></li>
-      </ul>
-    </li>
-    <li><a href="#usage">Usage</a></li>
-    <li><a href="#roadmap">Roadmap</a></li>
-    <li><a href="#contributing">Contributing</a></li>
-    <li><a href="#sources">Sources</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#contact">Contact</a></li>
-  </ol>
-</details> -->
 
 
 
@@ -63,62 +35,12 @@
 
 ### Built With
 
-* [![Torch][Torch]][Torch-url]
+* [![Torch][Torch]][Torch-url] <<3
+* [![huggingface-shield]][huggingface-url] (datasets, transformers, tokenizer, hub)
+* [![gradio-shield]][gradio-url] (web interface)
+* [![tiktoken-shield]][tiktoken-url] (tokenizer)
 
-
-
-<!-- GETTING STARTED -->
-<!-- ## Getting Started
-
-### Installation
-
-1. Clone the repo
-   ```sh
-   git clone git@github.com:art-test-stack/my-gpt.git
-   ```
-2. Create a virtual environment
-    
-    For example I use [virtualenv](https://virtualenv.pypa.io/en/latest/):
-   ```sh
-   virtualenv -p python 3.10 venv
-   ```
-3. Install pip packages
-   ```sh
-   pip install -r requirements.txt
-   ``` -->
-
-
-
-<!-- ## Usage -->
-
-
-
-
-<!-- ROADMAP -->
-<!-- ## Roadmap -->
-
-<!-- - [ ]  -->
-
-
-<!-- See the [open issues](https://github.com/art-test-stack/my-gpt/issues) for a full list of proposed features (and known issues). -->
-
-
-
-<!-- CONTRIBUTING -->
-<!-- ## Contributing
-
-Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
-
-If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
-Don't forget to give the project a star! Thanks again!
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request -->
-
-## Roadmap 
+### Roadmap 
 
 * Tokenization 
   - BPE implementation in Python
@@ -151,10 +73,43 @@ Don't forget to give the project a star! Thanks again!
   - generate data
   - model teacher
 
+## Get Started
+
+This project has been developed and tested with Python 3.13. To manage dependencies, I recommend using [`uv`](https://github.com/astral-sh/uv). 
+
+1. Clone the repo
+   ```sh
+   git clone git@github.com:art-test-stack/my-gpt.git
+    ```
+2. Install dependencies
+   ```sh
+   uv install
+   ```
+
+### Training a model
+
+Coming soon...
+
+### Chat with the model
+
+In this section, you will find instructions to run the chat interface with different models.
+
+Under development environment (`ENV='development'` in `.env`), you can run the chat interface with auto-reloading, use the following command:
+```sh
+uv run gradio my_gpt/scripts/chat_app.py --demo-name=app
+```
+
+Otherwise, if you don't want auto-reloading, use:
+```sh
+uv run python -m my_gpt.scripts.chat_app
+```
+
+Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
 
 ## Data
 
-<table>
+### Pre-training Data Summary
+<!-- <table>
     <thead>
         <tr>
             <th align="center">Source</th>
@@ -183,7 +138,7 @@ Don't forget to give the project a star! Thanks again!
             <th align="center">100.00 %</th>
         </tr>
     </tbody>
-</table>
+</table> -->
 
 <!-- Sources -->
 ## Sources
@@ -204,7 +159,7 @@ Distributed under the MIT License. See `LICENSE.txt` for more information.
 <!-- CONTACT -->
 ## Contact
 
-Arthur Testard - testardarthur@gmail.com
+Arthur Testard - [arthur.testard.pro@gmail.com](mailto:arthur.testard.pro@gmail.com)
 
 Project Link: [https://github.com/art-test-stack/my-gpt](https://github.com/art-test-stack/my-gpt)
 
@@ -228,3 +183,9 @@ Project Link: [https://github.com/art-test-stack/my-gpt](https://github.com/art-
 [product-screenshot]: images/screenshot.png
 [Torch]: https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white
 [Torch-url]: https://pytorch.org/
+[huggingface-shield]: https://img.shields.io/badge/HuggingFace-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white
+[huggingface-url]: https://huggingface.co/
+[gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
+[gradio-url]: https://gradio.app/
+[tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=tiktoken&logoColor=white
+[tiktoken-url]: https://github.com/openai/tiktoken
