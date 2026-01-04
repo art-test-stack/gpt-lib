@@ -16,10 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read versioning files
+        id: pyversion
+        run: echo "version=$(cat .python-version)" >> $GITHUB_OUTPUT
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ".python-version"
+          python-version: ${{ steps.pyversion.outputs.version }}
       
       - name: Install uv
         uses: astral-sh/setup-uv@v7
