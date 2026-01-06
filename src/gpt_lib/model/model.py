@@ -1,6 +1,12 @@
-from gpt_lib.model.layers import DecoderLayer, Linear, precompute_rope, precompute_positional_encoding
+from gpt_lib.model.layers import (
+    Module, 
+    DecoderLayer, 
+    Linear, 
+    apply_rms_norm,
+    precompute_rope, 
+    precompute_positional_encoding
+)
 from gpt_lib.model.loss import build_objective
-from gpt_lib.model.module import Module
 from gpt_lib.tokenizer.tokenizer import build_tokenizer
 from gpt_lib.utils.schemas import (
     get_default_device,
@@ -102,12 +108,13 @@ class Transformer(Module):
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pos_enc[:x.size(2)]
 
+        x = apply_rms_norm(x, eps=1e-8, torch_impl=True)
         attentions = []
         for i, decoder_layer in enumerate(self.layers.blocks):
-            return_attn = return_attentions and (i == len(self.decoder_stack) - 1)
+            return_attn = return_attentions and (i == len(self.layers.blocks) - 1)
             x, attn, _ = decoder_layer(
                 x=x, 
-                self_attention_mask=mask, 
+                mask=mask, 
                 # kv_cache=kv_cache, 
                 # return_attentions=return_attn
             )
@@ -115,25 +122,30 @@ class Transformer(Module):
             if return_attn:
                 attentions.append(attn)
 
+        x = apply_rms_norm(x, eps=1e-8, torch_impl=True)
+
         if return_hidden_states:
             hidden_states = x
+
+        softcap = 18
+        logits = self.model_head(x)
+        logits = torch.clamp(logits, min=-softcap, max=softcap)
         
         return TransformerOutput(
-            logits=self.model_head(x),
+            logits=logits,
             attentions=attn if return_attentions else None,
             hidden_states=hidden_states if return_hidden_states else None,
             kv_cache=kv_cache
         )
     
-    def get_pad_mask(self, seq: torch.Tensor):
-
+    def get_pad_mask(self, seq: torch.Tensor) -> torch.Tensor:
         pad_idx = self.padding_idx
-        pad_mask = (seq != pad_idx).unsqueeze(-2)
-
-        _, len_s = seq.size()
-        subsequent_mask = (1 - torch.triu(
-            torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
-        return pad_mask & subsequent_mask
+        pad_mask = (seq != pad_idx)
+        return pad_mask
+        # _, len_s = seq.size()
+        # subsequent_mask = (1 - torch.triu(
+        #     torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
+        # return pad_mask & subsequent_mask
 
 class GPTModel:
     def __init__(
@@ -164,8 +176,14 @@ class GPTModel:
             loss = self.loss_fn(logits, labels)
         return ModelOutput(logits=logits, loss=loss)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"GPTModel(config={self.config}, model={self.model})"
+    
+    def eval(self) -> None:
+        self.model.eval()
+
+    def train(self) -> None:
+        self.model.train()
 
     def forward(
             self, 

@@ -74,24 +74,23 @@ class TransformerConfig(BaseModel):
 
     vocab_size: int = VOCAB_SIZE
     max_context: int = MAX_CONTEXT
+    pad_id: int = -100
+
+    positional_encoding: Literal["positional", "rope"] = "rope" # Options: "positional", "rope"
 
     d_model: int = DIM_MODEL
     d_ffn: int = DIM_FFN  # 4 * dim_model
     n_heads: int = NUM_HEADS
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
+
     dropout: float = DROPOUT
     norm_before_attn: bool = True
-    enable_gqa: bool = False
-    
-    positional_encoding: Literal["positional", "rope"] = "rope" # Options: "positional", "rope"
 
     attn_type: Literal["sdpa", "flash", "torch"] = "sdpa"  # Options: "sdpa", "flash", "torch"
-    
-    pad_id: int = -100
+    enable_gqa: bool = False
 
-    nb_experts: int = 16  # Only used if tf_type is "moe"
-    expert_capacity_factor: float = 1.0  # Only used if tf_type is "moe"
+    softcap: float = 18.0
     
     def model_post_init(self, context: Any) -> None:
         if self.d_model % self.n_heads != 0:
@@ -166,6 +165,24 @@ class GPTConfig(BaseModel):
         self.dirname = self.dirname / self.name
         if not self.dirname.exists():
             self.dirname.mkdir(parents=True, exist_ok=True)
+
+        if not hasattr(self.model, "vocab_size"):
+            raise ValueError("Model configuration must have a vocab_size attribute.")
+        if not hasattr(self.tokenizer, "vocab_size"):
+            raise ValueError("Tokenizer configuration must have a vocab_size attribute.")
+        if hasattr(self.model, "vocab_size") and hasattr(self.tokenizer, "vocab_size"):
+            if self.model.vocab_size != self.tokenizer.vocab_size:
+                raise ValueError(f"Model vocab_size ({self.model.vocab_size}) does not match tokenizer vocab_size ({self.tokenizer.vocab_size})")
+            
+        if not hasattr(self.model, "max_context"):
+            raise ValueError("Model configuration must have a max_context attribute.")
+        if not hasattr(self.tokenizer, "max_context"):
+            raise ValueError("Tokenizer configuration must have a max_context attribute.")
+        if hasattr(self.model, "max_context") and hasattr(self.tokenizer, "max_context"):
+            if self.model.max_context != self.tokenizer.max_context:
+                raise ValueError(f"Model max_context ({self.model.max_context}) does not match tokenizer max_context ({self.tokenizer.max_context})")
+            
+        
 
         self.dtype = getattr(torch, self.dtype)
         self.device = torch.device(self.device)

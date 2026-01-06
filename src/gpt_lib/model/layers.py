@@ -58,7 +58,7 @@ def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor, pairwise_split: bool =
 
 
 def apply_positional_encoding(x: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
-    return pos_enc[:,:x.size(2)]
+    return pos_enc[:,:x.size(-1)]
 
 def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) -> torch.Tensor:
     if torch_impl:
@@ -86,29 +86,45 @@ def scaled_dot_product_attention(
     assert query.size(-1) == key.size(-1) == value.size(-1), "Last dimension of Query, Key and Value must be the same"
     assert query.device == key.device == value.device, "Query, Key and Value must be on the same device"
     assert query.device == device, "Query device and specified device must be the same"
+    print("query shape:", query.shape)
+    print("key shape:", key.shape)
+    print("value shape:", value.shape)
+    if attn_mask is not None:
+        if attn_mask.dim() == 2:
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
+        # if attn_mask.dim() == 2:
+        #     attn_mask = ...
+        #     print("unsqueezed attn_mask shape:", attn_mask.shape)
+        # assert attn_mask.size(1) == query.size(-2) and attn_mask.size(2) == key.size(-2), f"Attention mask size must match the sequence lengths of Query and Key. Got attn_mask size: {attn_mask.size()} (B,...,L,S), Query size: {query.size()} (B,...,Hq,L,E), Key size: {key.size()} (B,...,H,S,E)."
 
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=device)
+
+    causal_mask = torch.ones(0, dtype=torch.bool, device=device)
     if is_causal:
         assert attn_mask is not None, "'attn_mask' cannot be None when 'is_causal' is True."
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(device=device)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        causal_mask = torch.ones(L, S, dtype=torch.bool, device=device).tril(diagonal=0)
 
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
+            print("causal_mask shape:", causal_mask.shape)
+            print("attn_mask shape:", attn_mask.shape)
+            attn_bias = causal_mask & attn_mask
             attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
         else:
-            attn_bias = attn_mask + attn_bias
+            causal_mask.masked_fill_(causal_mask.logical_not(), float("-inf"))
+            attn_bias = attn_mask + causal_mask
 
     if enable_gqa:
+        if query.size(-3) != key.size(-3):
+            raise ValueError("For GQA, the number of query heads must match the number of key heads.")
         key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
     attn_weight += attn_bias
     attn_weight = F.softmax(attn_weight, dim=-1)
-    attn_weight = F.dropout(attn_weight, dropout_p, train=True)
+    attn_weight = F.dropout(attn_weight, dropout_p, training=True)
     return attn_weight @ value
 
 class Module(nn.Module):
@@ -218,20 +234,20 @@ class CausalSelfAttention(Module):
         self.w_v.init_weights(std)
         self.w_o.init_weights(methods="zero")
 
-    def forward(self, x: torch.Tensor, rope_cache=None, mask=None, kv_cache=None):
+    def forward(self, x: torch.Tensor, rope_cache=None, mask=None, kv_cache=None) -> torch.Tensor:
         n_heads = self.n_heads
         d_head = self.d_head
 
-        batch_size = x.size(0)
+        bs = x.size(0)
         len_x = x.size(1)
 
         q = self.w_q(x) # b X l X (n_heads*d_head)
         k = self.w_k(x)
         v = self.w_v(x)
 
-        q = q.view(batch_size, len_x, n_heads, d_head)
-        k = k.view(batch_size, len_x, n_heads, d_head)
-        v = v.view(batch_size, len_x, n_heads, d_head)
+        q = q.view(bs, len_x, n_heads, d_head)
+        k = k.view(bs, len_x, n_heads, d_head)
+        v = v.view(bs, len_x, n_heads, d_head)
 
         if rope_cache is not None:
             q = apply_rope(q, rope_cache)
@@ -245,30 +261,32 @@ class CausalSelfAttention(Module):
         if kv_cache is not None:
             k, v = kv_cache.insert(k, v)
 
-        if mask is not None:
-            mask = mask.unsqueeze(1)  
-        
-        output, attention = scaled_dot_product_attention(q, k, v, scale=d_head, attn_mask=mask, is_causal=True)
+        # if mask is not None:
+        #     mask = mask.unsqueeze(1)  
+        # TODO: Support different attention implementations
+        # TODO: Use context manager to select attention implementation
+        # TODO: Detect context manager and use the corresponding attention implementation
+        output = scaled_dot_product_attention(q, k, v, scale=d_head, attn_mask=mask, is_causal=True)
     
-        output = output.transpose(1, 2).contiguous().view(batch_size, len_x, -1)
+        output = output.transpose(1, 2).contiguous().view(bs, len_x, -1)
         output = self.w_o(output)
-        return output, attention
+        return output, None
 
     
 class FeedForward(Module):
     '''Position-Wise Feed Forward Network'''
     def __init__(self, d_in: int, d_latent: int, dropout: float) -> None:
         super().__init__()
-        self.w_1 = Linear(d_in, d_latent, dropout)
-        self.w_2 = Linear(d_latent, d_in, dropout)
-        self.dropout = nn.Dropout(dropout)
+        self.w_1 = Linear(d_in, d_latent)
+        self.w_2 = Linear(d_latent, d_in)
+        self.dropout_rate = dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.w_2(F.relu(self.w_1(x)))
 
         if self.training:
-            h = self.dropout(h)
-            
+            h = F.dropout(h, p=self.dropout_rate, training=True)
+                
         h += x
         output = apply_rms_norm(h)
         return output
@@ -299,15 +317,14 @@ class DecoderLayer(Module):
             norm_before_attn=norm_before_attn   
         )
         
-        self.dropout = nn.Dropout(dropout)
-        
         self.ffn = FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
+        self.dropout_rate = dropout
 
-    def forward(self, x, self_attention_mask=None,):
-        h, self_attention = self.attention(x, mask=self_attention_mask)
+    def forward(self, x, mask=None,):
+        h, self_attention = self.attention(x, mask=mask)
 
         if self.training:
-            h = self.dropout(h) 
+            h = F.dropout(h, p=self.dropout_rate, training=True)
         h += x
         h = apply_rms_norm(h)
         output = h + self.ffn(h)

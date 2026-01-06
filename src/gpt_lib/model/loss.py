@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from gpt_lib.utils.schemas import ModelOutput, ObjectiveConfig 
 
+from cut_cross_entropy import linear_cross_entropy
+
 class Objective(ABC):
     @abstractmethod
     def __call__(
@@ -32,6 +34,25 @@ class CrossEntropyObjective(Objective):
             reduction=self.reduction,
         )
         return loss
+
+class CutCrossEntropyObjective(Objective):
+    def __init__(self, ignore_index=-100, reduction="mean"):
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+    def __call__(self, output: ModelOutput, labels: torch.Tensor, ref_output=None):
+        raise NotImplementedError("CutCrossEntropyObjective is not yet supported.")
+        logits = output.logits
+
+        loss = linear_cross_entropy(
+            logits,
+            labels,
+            ignore_index=self.ignore_index,
+            reduction=self.reduction,
+            impl="torch_compile"
+        )
+        return loss
+
 
 class KLDivObjective(Objective):
     def __init__(self, epsilon: float = 0.1, ignore_index: int = -100):

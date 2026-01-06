@@ -27,7 +27,7 @@ from torch.distributed.tensor.parallel import (
     PrepareModuleInput,
     SequenceParallel
 )
-from torch.distributed._tensor.device_mesh import init_device_mesh
+from torch.distributed.tensor.device_mesh import init_device_mesh
 
 from typing import Callable
 

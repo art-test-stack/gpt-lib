@@ -91,6 +91,7 @@ class TestGPTModel:
             stream=False
         )
         with torch.no_grad():
+            model.eval()
             output = model.forward(input_ids=input_ids, labels=labels, **generation_config.__dict__)
             logits = model(
                 input_ids=input_ids,

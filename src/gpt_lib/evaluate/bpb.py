@@ -14,7 +14,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor) -> float:
         - V: vocabulary size
     
     Args:
-        - model (callable): The language model to evaluate. model(x, y, loss_reduction='none') -> loss per token.
+        - model (nn.Module): The language model to evaluate. model(x, y, loss_reduction='none') -> loss per token.
             Expects:
                 -  x (torch.int64): token ids tensor with shape (B, S)
                 - y (torch.int64): token ids tensor with shape (B, S)
