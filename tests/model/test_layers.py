@@ -3,7 +3,8 @@ from gpt_lib.model.layers import (
     apply_rope,
     precompute_rope, 
     apply_rms_norm,
-    scaled_dot_product_attention
+    scaled_dot_product_attention,
+    SelfAttentionMask,
 )
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,42 @@ def test_rms_norm():
 
     assert torch.allclose(rms_normed_x1, rms_normed_x2), "RMSNorm output does not match expected output"
 
+class TestSelfAttentionMask:
+    pad_idx = 0
+    max_context = 8
+    mask_generator = SelfAttentionMask(pad_idx=pad_idx, max_context=max_context)
+    expected_mask = torch.tensor([[[
+        [0,  -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf')],
+        [0, 0, -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf')],
+        [0, 0, 0, -float('inf'), -float('inf'), -float('inf'), -float('inf'), -float('inf')],
+        [0, 0, 0, 0     , -float('inf'), -float('inf'), -float('inf'), -float('inf')],
+        [0, 0, 0, 0     , 0     , -float('inf'), -float('inf'), -float('inf')],
+        [0, 0, 0, 0     , 0     , 0     , -float('inf'), -float('inf')],          
+        [0, 0, 0, 0     , 0     , 0     , 0     , -float('inf')],
+        [0, 0, 0, 0     , 0     , 0     , 0     , 0]]]]
+    )
+
+    @pytest.mark.fast
+    def test_self_attention_mask(self):
+
+        input_ids = torch.arange(1, self.max_context + 1).unsqueeze(0)
+        attn_mask = self.mask_generator(input_ids, mask_pad_token=False, to_bool=False, is_causal=True)
+        print("attn_mask", attn_mask)
+        assert attn_mask.shape == (1, 1, self.max_context, self.max_context), "Attention mask has incorrect shape."
+        assert attn_mask.shape == self.expected_mask.shape, "Attention mask shape does not match expected shape."
+        assert torch.equal(attn_mask, self.expected_mask), "Attention mask does not match expected mask for no padding case."
+
+    @pytest.mark.fast
+    def test_self_attention_mask_with_padding(self):
+
+        input_ids = torch.arange(1, self.max_context - 2).tolist() + [self.pad_idx] * 3
+        input_ids = torch.tensor(input_ids).unsqueeze(0)
+
+        attn_mask = self.mask_generator(input_ids, to_bool=False)
+        expected_mask_with_padding = self.expected_mask.clone()
+        expected_mask_with_padding[0, 0, :, -3:] = -float('inf')
+
+        assert torch.equal(attn_mask, expected_mask_with_padding), "Attention mask does not match expected mask for padding case."
 
 class TestSDPA:
     B, H, S, E = 4, 4, 16, 8
@@ -41,14 +78,9 @@ class TestSDPA:
 
         sdpa, _ = scaled_dot_product_attention(query, key, value)
 
-        # Reference implementation using PyTorch's built-in functions
-        def reference_sdpa(query, key, value):
-                output = F.scaled_dot_product_attention(
-                    query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
-                )
-                return output
-
-        reference_output = reference_sdpa(query, key, value)
+        reference_output = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
         self.common_assertions(sdpa, reference_output, (B, H, S, E))
 
     @pytest.mark.fast
@@ -62,6 +94,25 @@ class TestSDPA:
 
         ref_output = F.scaled_dot_product_attention(
             query, key, value, dropout_p=0.0, is_causal=True
+        )
+
+        self.common_assertions(sdpa, ref_output, (B, H, S, E))
+    
+    @pytest.mark.fast
+    def test_sdpa_with_mask(self):
+        B, H, S, E = self.B, self.H, self.S, self.E
+        query = self.query
+        key = self.key
+        value = self.value
+
+        attn_mask = SelfAttentionMask(pad_idx=-100, max_context=self.S).get(
+            seq=torch.randint(0, 10, (B, S)), mask_pad_token=False, to_bool=False, is_causal=True
+        )
+
+        sdpa, _ = scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+
+        ref_output = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
         )
 
         self.common_assertions(sdpa, ref_output, (B, H, S, E))
@@ -107,12 +158,4 @@ class TestRoPE:
         x = torch.randn(_bs, n_head, seq_len, d_head) 
         x_rope = apply_rope(x, rope_cache)
         assert x_rope.shape == x.shape, f"Output shape mismatch: {x_rope.shape} != {x.shape}"
-
-        # Check that applying RoPE twice returns to original (approximately)
-        # x_recovered = apply_rope(x_rope, rope_cache)
-        # assert torch.allclose(x, x_recovered, atol=1e-5), "RoPE application is not reversible"
-
-# to test exception raising
-# def test_mytest():
-#     with pytest.raises(SystemExit):
-#         f()
+        

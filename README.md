@@ -75,7 +75,7 @@
 
 ## Get Started
 
-This project has been developed and tested with Python 3.13. To manage dependencies, I recommend using [`uv`](https://github.com/astral-sh/uv). 
+This project has been developed and tested with Python 3.12. To manage dependencies, I recommend using [`uv`](https://github.com/astral-sh/uv). 
 
 1. Clone the repo
    ```sh
@@ -86,13 +86,12 @@ This project has been developed and tested with Python 3.13. To manage dependenc
     uv sync
    ```
    If running on Linux with CUDA available, you can install the GPU version of PyTorch by running:
-
     ```sh
     uv sync --extra cuda
-    ```
+     ```
 
-    > [!NOTE]  
-    > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation.
+> [!NOTE]  
+> Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation.
 
 
 ### Training a model

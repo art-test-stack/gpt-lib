@@ -1,5 +1,6 @@
 from gpt_lib.utils.schemas import TransformerConfig
 from gpt_lib.utils.default import DEVICE, DEVICE_NAME, MAX_CONTEXT
+from gpt_lib.model.utils import SelfAttentionMask
 import math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -67,6 +68,8 @@ def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) 
         rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
         return x / rms
 
+        
+
 def scaled_dot_product_attention(
         query: torch.Tensor, 
         key: torch.Tensor, 
@@ -88,6 +91,8 @@ def scaled_dot_product_attention(
     assert query.device == key.device == value.device, f"Query, Key and Value must be on the same device. Got Query device: {query.device}, Key device: {key.device}, Value device: {value.device}."
     assert query.device == device, f"Q, K, V devices and specified device must be the same. Got Query device: {query.device}, Key device: {key.device}, Value device: {value.device}, specified device: {device}."
 
+    assert (not is_causal) or (attn_mask is None), "`is_causal` cannot be True when `attn_mask` is provided. This behavior is given as a imitation of PyTorch's scaled_dot_product_attention."
+
     if attn_mask is not None:
         if attn_mask.dim() == 2:
             attn_mask = attn_mask.unsqueeze(1).unsqueeze(1) # B x 1 x 1 x S
@@ -106,15 +111,12 @@ def scaled_dot_product_attention(
     if is_causal:
         causal = torch.tril(torch.ones(L, S, device=device))
         attn_bias = attn_bias.masked_fill(causal == 0, float("-inf"))
-        print("attn_bias", attn_bias)
 
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             attn_bias = attn_bias.masked_fill(~attn_mask, float("-inf"))
         else:
-            attn_bias = attn_bias + attn_mask
-
-    print("attn_bias after mask", attn_bias)
+            attn_bias = attn_mask
 
     if enable_gqa:
         if query.size(-3) != key.size(-3):
@@ -229,7 +231,7 @@ class CausalSelfAttention(Module):
         self.w_v.init_weights(std)
         self.w_o.init_weights(method="zero")
 
-    def forward(self, x: torch.Tensor, rope_cache=None, mask=None, kv_cache=None, return_attn_weights: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cache=None, attn_mask=None, kv_cache=None, return_attn_weights: bool = False) -> torch.Tensor:
         n_heads = self.n_heads
         d_head = self.d_head
 
@@ -262,8 +264,8 @@ class CausalSelfAttention(Module):
         # TODO: Use context manager to select attention implementation
         # TODO: Detect context manager and use the corresponding attention implementation
         output, attn_weights = scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=self.dropout_rate if self.training else .0, 
-            is_causal=True, return_attn_weights=return_attn_weights
+            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_rate if self.training else .0, 
+            is_causal=attn_mask is None, return_attn_weights=return_attn_weights
         )
     
         output = output.transpose(1, 2).contiguous().view(bs, len_x, -1)
@@ -317,8 +319,8 @@ class DecoderLayer(Module):
         self.ffn = FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
         self.dropout_rate = dropout
 
-    def forward(self, x, mask=None,):
-        h, self_attn = self.attention(x, mask=mask)
+    def forward(self, x, attn_mask=None, kv_cache=None):
+        h, self_attn = self.attention(x, attn_mask=attn_mask, kv_cache=kv_cache)
 
         if self.training:
             h = F.dropout(h, p=self.dropout_rate, training=True)
@@ -326,7 +328,7 @@ class DecoderLayer(Module):
         h = apply_rms_norm(h)
         output = h + self.ffn(h)
 
-        return output, self_attn, None
+        return output, self_attn
 
 class MixtureOfExpertsLayer(Module):
     '''Mixture of Experts layer'''

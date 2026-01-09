@@ -1,4 +1,5 @@
 from gpt_lib.model.layers import (
+    SelfAttentionMask,
     Module, 
     DecoderLayer, 
     Linear, 
@@ -7,6 +8,7 @@ from gpt_lib.model.layers import (
     precompute_positional_encoding
 )
 from gpt_lib.model.loss import build_objective
+from gpt_lib.model.utils import SelfAttentionMask
 from gpt_lib.tokenizer.tokenizer import build_tokenizer
 from gpt_lib.utils.schemas import (
     get_default_device,
@@ -87,11 +89,11 @@ class Transformer(Module):
         ))
         
         self.model_head = Linear(args.d_model, args.vocab_size, bias=False)
-
                 
     def forward(
             self, 
             input_ids: torch.Tensor,
+            attn_mask: torch.Tensor | None = None,
             kv_cache: dict | None = None,
             return_attentions: bool = False,
             return_hidden_states: bool = False,
@@ -102,7 +104,7 @@ class Transformer(Module):
             input_ids = input_ids.unsqueeze(0)
         assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
-        mask = self.get_pad_mask(input_ids)
+
         x = self.layers.emb(input_ids)
 
         if self.config.positional_encoding == "positional_encoding":
@@ -112,11 +114,13 @@ class Transformer(Module):
         attentions = []
         for i, decoder_layer in enumerate(self.layers.blocks):
             return_attn = return_attentions and (i == len(self.layers.blocks) - 1)
-            x, attn, _ = decoder_layer(
+            x, attn = decoder_layer(
                 x=x, 
-                mask=mask, 
+                attn_mask=attn_mask,
+                # TODO: not yet supported
                 # kv_cache=kv_cache, 
-                # return_attentions=return_attn
+                # TODO: return_attn in special cases only -> interpretability
+                # return_attentions=return_attn 
             )
             assert x.nansum() != 0, f"NaN detected in layer {i} output."
             if return_attn:
@@ -138,28 +142,23 @@ class Transformer(Module):
             kv_cache=kv_cache
         )
     
-    def get_pad_mask(self, seq: torch.Tensor) -> torch.Tensor:
-        pad_idx = self.padding_idx
-        pad_mask = (seq != pad_idx)
-        return pad_mask
-        # _, len_s = seq.size()
-        # subsequent_mask = (1 - torch.triu(
-        #     torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
-        # return pad_mask & subsequent_mask
 
 class GPTModel:
     def __init__(
             self,
-            model: torch.nn.Module | None = None,
+            model: torch.nn.Module,
+            tokenizer: callable,
             config: GPTConfig = GPTConfig()
         ) -> None:
         super().__init__()
         self.config = config
-        self.tokenizer = build_tokenizer(config.tokenizer)
+        self.tokenizer = tokenizer
         # TODO: Add support for loading Dense vs MoE vs Hybrid models
         self.model = model
         self.loss_fn = build_objective(config.objective)
         self.model = self.model.to(DEVICE)
+
+        self.attn_mask = SelfAttentionMask(pad_idx=config.model.pad_id, max_context=config.model.max_context)
 
         assert self.model is not None, "Model must be provided"
         assert all(hasattr(self.model, attr) for attr in ["config", "padding_idx", "vocab_size"]), "Model must have config, padding_idx and vocab_size attributes"
@@ -169,7 +168,8 @@ class GPTModel:
     
     def __call__(self, input_ids, labels=None, *args, **kwargs) -> ModelOutput:
         input_ids = input_ids.to(self.config.device)
-        logits = self.model(input_ids, *args, **kwargs).logits
+        attn_mask = self.attn_mask(input_ids)
+        logits = self.model(input_ids, attn_mask=attn_mask, *args, **kwargs).logits
         loss = None
         if labels is not None:
             labels = labels.to(self.config.device)
@@ -185,12 +185,17 @@ class GPTModel:
     def train(self) -> None:
         self.model.train()
     
+    def update_max_context(self, new_max_context: int) -> None:
+        assert new_max_context > 0, "New max context must be positive"
+        self.config.model.max_context = new_max_context
+        self.attn_mask = self.attn_mask.update_max_context(new_max_context)
+
     def encode_batch(self, texts: List[str], add_special_tokens: bool = True) -> List[List[int]]:
-        # Dummy implementation
+        # TODO: Change current dummy implementation
         return self.tokenizer.batch_encode(texts, add_special_tokens=add_special_tokens)
     
     def decode_batch(self, token_ids: List[List[int]]) -> List[str]:
-        # Dummy implementation
+        # TODO: Change current dummy implementation
         return [self.tokenizer.decode(ids) for ids in token_ids]
 
     def forward(
@@ -205,9 +210,11 @@ class GPTModel:
         ) -> ModelOutput:
         input_ids = input_ids.to(self.config.device)
         labels = labels.to(self.config.device) if labels is not None else None
+        attn_mask = self.attn_mask(input_ids)
         output: TransformerOutput = self.model(
             input_ids, 
             return_attentions=attentions, 
+            attn_mask=attn_mask,
             kv_cache=kv_cache
         )
         if temperature > 0:
@@ -244,7 +251,7 @@ class GPTModel:
         if isinstance(generation_config, dict):
             generation_config = GenerationConfig(**generation_config)
 
-        self.model.eval()
+        self.eval()
         if isinstance(text, str):
             text = [text]
         input_ids = self.tokenizer.batch_encode(text, add_special_tokens=True)
@@ -281,6 +288,7 @@ class GPTModel:
             generated = torch.cat((generated, next_token), dim=1)
 
             if generation_config.stream:
+                # During streaming, yield intermediate outputs
                 yield ModelCompletionOutput(
                     logits=output.logits,
                     loss=output.loss,
@@ -355,6 +363,7 @@ class GPTModel:
             ckpt_version += ".pth"
         config = GPTConfig.from_file(model_name=model_name, model_dir=model_dir)
         model = Transformer(args=config.model, device=config.device, dtype=config.dtype)
+        tokenizer = build_tokenizer(config.tokenizer)
         model_path = config.dirname / ckpt_version
         if not device:
             device = config.device
@@ -362,7 +371,7 @@ class GPTModel:
             device = get_default_device()
             config.device = device
         model.load_state_dict(torch.load(model_path, map_location=device))
-        return cls(model=model, config=config)
+        return cls(model=model, tokenizer=tokenizer, config=config)
     
     @classmethod
     def from_scratch(
@@ -371,7 +380,8 @@ class GPTModel:
         ) -> "GPTModel":
         config.to_file(mode="pickle")
         model = Transformer(args=config.model, device=config.device, dtype=config.dtype)
-        gpt = cls(model=model, config=config)
+        tokenizer = build_tokenizer(config.tokenizer)
+        gpt = cls(model=model, tokenizer=tokenizer, config=config)
         gpt.init_weights()
         return gpt
     
@@ -382,7 +392,8 @@ class GPTModel:
         ) -> "GPTModel":
         config = GPTConfig.from_yaml(yaml_path)
         model = Transformer(args=config.model, device=config.device, dtype=config.dtype)
-        gpt = cls(model=model, config=config)
+        tokenizer = build_tokenizer(config.tokenizer)
+        gpt = cls(model=model, tokenizer=tokenizer, config=config)
         gpt.init_weights()
         return gpt
     
@@ -393,7 +404,7 @@ class GPTModel:
         ) -> None:
         if ckpt_version is None:
             ckpt_version = "checkpoint.pth"
-        if not ckpt_version.endswith(".pth"):
+        if (not ckpt_version.endswith(".pth")) and (not ckpt_version.endswith(".pt")):
             ckpt_version += ".pth"
         model_path = self.config.dirname / ckpt_version
         torch.save(self.model.state_dict(keep_vars=keep_vars), model_path)
