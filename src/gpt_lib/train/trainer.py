@@ -1,35 +1,47 @@
 from gpt_lib.model.model import GPTModel
+from gpt_lib.utils.schemas import TrainingConfig, TrainingState, TrainingMetrics
 from gpt_lib.train.optimizer import AdamW
 
-from gpt_lib.data.dataset import Dataset
-# from michelgpt.data.tokenizer.models import HGFBPETokenizer as Tokenizer
-from gpt_lib.tokenizer.tok import TikTokenizer as Tokenizer
 
-from gpt_lib.utils.default import *
+from gpt_lib.utils.default import DEVICE
 
 import torch
-from torch import nn, optim
+from torch import nn
 from torch.utils.data import DataLoader
 
 import numpy as np
 import time, pickle
 # import time, pickle, wandb
-from typing import Callable
+from typing import Callable, Iterable
 from pathlib import Path
 
-class TrainerMetrics:
-    def __init__(self) -> None:
-        pass
 
-class Trainer():
-
+class Trainer:
     def __init__(
             self, 
-            model: GPTModel,
-            config: Settings,
+            model: GPTModel, # tokenizer should be integrated in the model
+            train_dataset: Iterable,
+            val_dataset: Iterable,
+            test_dataset: Iterable,
+            config: TrainingConfig | None = None,
+            device: torch.device = DEVICE,
+            dtype: torch.dtype = torch.float32,
+            optimizer: torch.optim.Optimizer | None = None, # optional optimizer builder
         ):
         super().__init__()
 
+        self.config: TrainingConfig = config if config is not None else model.config.trainer 
+        self.model = model.to(device=device, dtype=dtype)
+
+        if not optimizer:
+            optimizer = model.build_optimizer() # to make
+        self.optimizer = optimizer
+
+        self.train_set = train_dataset
+        self.val_set = val_dataset
+        self.test_set = test_dataset
+
+        self.metrics = TrainingMetrics()
         self.time = .0
         self.iter = 0
         self.tokens = 0
@@ -40,16 +52,9 @@ class Trainer():
         self.val_loss = .0
         self.val_accuracy = .0
         self.best_val_loss = float('inf')
-
-        if optimizer is None:
-            self.optimizer = AdamW(model.parameters())
-        else:
-            self.optimizer = optimizer(model.parameters())
-        self.tokenizer = tokenizer
-
+            
         self.max_sequence_length = self.model.max_content
         self.softmax = nn.Softmax(dim=-1)
-        self.loss_function = nn.CrossEntropyLoss(ignore_index=padding_token, reduction="sum")
 
         self.device = device
         self.metrics = {
@@ -125,34 +130,23 @@ class Trainer():
             return
         
         self.model.load_state_dict(torch.load(path.joinpath("model.pt"), map_location=DEVICE))
-        self.optimizer.load_state_dict(torch.load(path.joinpath("optimizer.pt"), map_location=DEVICE))
-
-
-    def next_token_probabilities(self, x, mask, temperature=1.0):
-        logits = self.model(x, mask)[:, -1]
-
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        probabilities = self.softmax(logits)
-        return probabilities
-    
+        self.optimizer.load_state_dict(torch.load(path.joinpath("optimizer.pt"), map_location=DEVICE))    
 
     def find_previous_session(self):
         pass
-
     
-    def fit(self, dataset: Dataset, batch_size: int = 1024):
+    def fit(self):
+
         self.time = time.time()
 
         train_set = DataLoader(
-            dataset=dataset.dataset,
-            batch_size=batch_size,
+            dataset=self.train_set,
+            batch_size=self.config.batch_size,
             shuffle=True
         )
         val_set = DataLoader(
-            dataset.dataset,
-            batch_size=batch_size,
+            dataset=self.val_set,
+            batch_size=self.config.batch_size,
             shuffle=True
         )
 
@@ -188,10 +182,12 @@ class Trainer():
             if self.iter % VALIDATION_STEP == 0:
                 self._validation_step(val_set)
 
+    def _training_loop(self):
+        pass
 
     def _training_step(self):
         pass
 
 
-    def _validation_step(self, val_set: Dataset):
+    def _validation_step(self):
         pass

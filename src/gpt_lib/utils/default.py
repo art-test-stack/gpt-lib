@@ -101,3 +101,8 @@ muon_opt_params = {
     "beta2": BETA_2,
     "epsilon": EPSILON
 }
+
+opt_params = dict(
+    adamw=adamw_opt_params,
+    muon=muon_opt_params
+)

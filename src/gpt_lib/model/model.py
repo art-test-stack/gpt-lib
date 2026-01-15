@@ -11,7 +11,6 @@ from gpt_lib.model.loss import build_objective
 from gpt_lib.model.utils import KVCache, SelfAttentionMask
 from gpt_lib.tokenizer.tokenizer import build_tokenizer
 from gpt_lib.utils.schemas import (
-    TOKENIZER_TENSORS,
     get_default_device,
     GenerationConfig,
     GPTConfig, 
@@ -20,6 +19,7 @@ from gpt_lib.utils.schemas import (
     TransformerConfig, 
     TransformerOutput, 
 )
+from gpt_lib.utils.types import Dtypes, Devices, TokenizerTensors
 from gpt_lib.utils.default import MODELS_FOLDER, DEVICE
 
 from typing import List, Iterator
@@ -203,16 +203,33 @@ class GPTModel:
 
     def train(self) -> None:
         self.model.train()
+
+    def to(self, *args, **kwargs) -> None:
+        self.model = self.model.to(*args, **kwargs)
+        self.config.device = self.model.device
+        self.config.dtype = self.model.dtype
+
+    def estimate_flops(self) -> float:
+        """Estimate FLOPs per token based on model configuration.
+
+        from: karpathy/nanochat https://github.com/karpathy/nanochat/discussions/420#:~:text=def-,estimate_flops,-(self)%3A
+        """
+        nparams = self.number_of_parameters()
+        nparams_emb = self.model.emb.weight.numel()
+
+        l, h, q, t = self.config.model.n_layers, self.config.model.n_heads, self.config.model.d_model // self.config.model.n_heads, self.config.model.max_context
+        flops_per_token = 6 * (nparams - nparams_emb) + 12 * l * h * q * t
+        return flops_per_token
     
     def update_max_context(self, new_max_context: int) -> None:
         assert new_max_context > 0, "New max context must be positive"
         self.config.model.max_context = new_max_context
         self.attn_mask = self.attn_mask.update_max_context(new_max_context)
 
-    def encode(self, text: str, add_special_tokens: bool = True, return_tensors: TOKENIZER_TENSORS = "pt") -> List[int]:
+    def encode(self, text: str, add_special_tokens: bool = True, return_tensors: TokenizerTensors = "pt") -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens, return_tensors=return_tensors)
     
-    def encode_batch(self, texts: List[str], add_special_tokens: bool = True, return_tensors: TOKENIZER_TENSORS = "pt") -> List[List[int]]:
+    def encode_batch(self, texts: List[str], add_special_tokens: bool = True, return_tensors: TokenizerTensors = "pt") -> List[List[int]]:
         # TODO: Change current dummy implementation
         return self.tokenizer.batch_encode(texts, add_special_tokens=add_special_tokens, return_tensors=return_tensors)
     
@@ -255,6 +272,7 @@ class GPTModel:
             loss=loss,
             attentions=output.attentions if attentions else None,
             log_probs=F.log_softmax(logits, dim=-1) if log_prob else None,
+            probs=F.softmax(logits, dim=-1) if log_prob else None,
             hidden_states=output.hidden_states,
             kv_cache=kv_cache,
         )
@@ -374,9 +392,13 @@ class GPTModel:
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
     
-    def get_optimzer(self) -> torch.optim.Optimizer:
+    def build_optimizer(self) -> torch.optim.Optimizer:
         # TODO: return optimizer based on config
-        pass
+        opt_config = self.config.trainer._optimizers
+
+        # kwargs = {
+        #     "emb": { self.model.emb.parameters(), opt_config["emb"].kwargs },
+        # }
         
     
     @classmethod

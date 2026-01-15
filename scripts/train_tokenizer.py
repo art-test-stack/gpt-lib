@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser(description="Train BPE tokenizer on a given cor
 parser.add_argument('--max_chars', type=int, default=10_000_000_000, help='Maximum characters to train or evaluate on (default: 10B)')
 parser.add_argument("--chars_per_doc", type=int, default=10_000, help="Maximum number of characters per document to use from the corpus for training or evaluation (default: 10,000).")
 parser.add_argument("--vocab_size", type=int, default=32_000, help="Vocabulary size for BPE tokenizer (default: 30,000).")
-parser.add_argument("--name", type=str, default="yc1_tokenizer", help="Name of the tokenizer (default: 'yc1_tokenizer').")
+parser.add_argument("--name", type=str, default="ic1_tokenizer", help="Name of the tokenizer (default: 'ic1_tokenizer').")
 parser.add_argument("--corpus_path", type=str, default="./.data/corpus.txt", help="Path to the corpus file (default: './.data/corpus.txt').")
 parser.add_argument("--write_corpus", action="store_true", help="Flag to indicate training mode.")
 parser.add_argument("--fast", action="store_true", help="Flag to indicate using fast implementation.")

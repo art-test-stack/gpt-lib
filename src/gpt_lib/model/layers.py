@@ -6,18 +6,28 @@ from gpt_lib.utils.schemas import (
 from gpt_lib.utils.default import DEVICE, DEVICE_NAME
 import math
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+import torch.distributed as dist
+from typing import Literal, Tuple
 import warnings
+
+# -------------- Check for optional dependencies -------------- #
 try:
     import flash_attn
     _flash_attention_installed = True
 except ImportError:
     flash_attn = None
     _flash_attention_installed = False
+try: 
+    from kernels import get_kernels
+    flash_attn3 = get_kernels('varunneal/flash-attention-3').flash_attn_interface
+    _kernels_installed = True
+except ImportError:
+    kernels = None
+    flash_attn3 = None
+    _kernels_installed = False
 
 # -------------- Positional Encoding utilities -------------- #
 
@@ -157,6 +167,40 @@ class Linear(nn.Linear, Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
+class TPLinear(Linear):
+    '''Tensor Parallel Linear layer'''
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, 
+                 device: torch.device = DEVICE, dtype=None, tp_spec=None, parallel_axis=None) -> None:
+        tp_size = tp_spec.size if tp_spec else None
+        assert out_features % tp_size == 0, "out_features must be divisible by tp_size"
+        self.tp_spec = tp_spec
+        self.axis = parallel_axis
+        if tp_spec is None:
+            super().__init__(
+                in_features=in_features, 
+                out_features=out_features, bias=bias, device=device, dtype=dtype
+            )
+        
+        assert self.axis in ["row", "column"], "parallel_axis must be 'row' or 'column'"
+
+        if parallel_axis == "row":
+            assert out_features % tp_size == 0, f"out_features must be divisible by tp_size for row parallelism. Got out_features={out_features}, tp_size={tp_size}."
+            local_out = out_features // tp_size
+            super().__init__(
+                in_features=in_features // tp_size, 
+                out_features=out_features, bias=bias, device=device, dtype=dtype
+            )
+
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        if (self.tp_spec is None) or (self.axis == "column"):
+            return super().forward(x)
+        
+        out = super().forward(x)
+        dist.all_reduce(out, group=self.tp_spec.tp_group)
+        return out
+
 # --------------      Attention utilities      -------------- #
 
 def scaled_dot_product_attention(
@@ -253,6 +297,12 @@ class QKVProjection(Module):
         v = self.w_v(x)  # B x S x (n_heads_kv*d_head)
         return q, k, v
 
+def build_qkv_projection(d_model: int, n_heads_q: int, n_heads_kv: int, d_head: int, bias: bool = False
+                         ) -> Literal[QKVProjection, FusedQKVProjection]:
+    if n_heads_q == n_heads_kv:
+        return FusedQKVProjection(d_model, n_heads_q, d_head, bias=bias)
+    else:
+        return QKVProjection(d_model, n_heads_q, n_heads_kv, d_head, bias=bias)
 
 class CausalSelfAttention(Module):
     def __init__(self, dim_model: int, n_heads: int, d_head: int, 
@@ -466,7 +516,7 @@ class DecoderLayer(Module):
         return output, self_attn
 
 class MixtureOfExpertsLayer(Module):
-    '''Mixture of Experts layer'''
+    '''Mixture of Experts layer. Note: This is a simplified version without load balancing or capacity constraints. '''
     def __init__(
             self, 
             dim_model: int, 
@@ -475,6 +525,7 @@ class MixtureOfExpertsLayer(Module):
             dropout: float
         ) -> None:
         super().__init__()
+        warnings.warn("This is a simplified Mixture of Experts layer without load balancing or capacity constraints. Use with caution.", UserWarning)
         self.experts = nn.ModuleList([
             FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
             for _ in range(n_experts)

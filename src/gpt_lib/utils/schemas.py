@@ -1,8 +1,7 @@
 import torch
 import torch.distributed as dist
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Any, List, Callable, Literal
-from torch import nn
+from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
+from typing import Any, List, Literal, get_args
 from pathlib import Path
 import json
 import pickle
@@ -28,22 +27,41 @@ from gpt_lib.utils.default import (
     VALIDATION_STEP, 
     PRETRAINING_VAL_RATIO,
     PAT_STR_GPT2,
-    PAT_STR_GPT4
+    PAT_STR_GPT4,
+    adamw_opt_params,
+    opt_params
+)
+from gpt_lib.utils.types import (
+    AttnImplTypes,
+    Betas2,
+    Devices,
+    Dtypes,
+    LossReductionTypes,
+    LossTypes,
+    NormalizationTypes,
+    Nus2,
+    OptimizerNames,
+    PositionalEncodingTypes,
+    TfTypes,
+    TokenizerSources,
+    TokenizerTensors,
+    TParams,
+    TpModes,
 )
 from gpt_lib.utils.special_tokens import SpecialTokens
 
-DEVICES = Literal["cpu", "cuda", "mps"]
-TOKENIZER_SOURCES = Literal["tiktoken", "bytelevelbpe", "rustbpe", "huggingface", "dummy"]
-TOKENIZER_TENSORS = Literal["pt", "np", "tf", "jax"]
-NORMALIZATION_TYPES = Literal["rms", "layer"]
-ATTN_IMPL_TYPES = Literal["sdpa", "flash_attention", "impl"]
-POSITIONAL_ENCODING_TYPES = Literal["positional", "rope"]
-TF_TYPES = Literal["dense", "moe"]
-DTYPES = Literal["float32", "float16", "bfloat16"]
-OPTIMIZERS = Literal["adamw", "sgd", "adam", "muon"]
-LOSS_TYPES = Literal["cross_entropy", "kl_divergence"]
-LOSS_REDUCTION_TYPES = Literal["none", "mean", "sum"]
-TP_MODES = Literal["row", "column"]
+# DEVICES = Literal["cpu", "cuda", "mps"]
+# TOKENIZER_SOURCES = Literal["tiktoken", "bytelevelbpe", "rustbpe", "huggingface", "dummy"]
+# TOKENIZER_TENSORS = Literal["pt", "np", "tf", "jax"]
+# NORMALIZATION_TYPES = Literal["rms", "layer"]
+# ATTN_IMPL_TYPES = Literal["sdpa", "flash_attention", "impl"]
+# POSITIONAL_ENCODING_TYPES = Literal["positional", "rope"]
+# TF_TYPES = Literal["dense", "moe"]
+# DTYPES = Literal["float32", "float16", "bfloat16"]
+# OPTIMIZERS = Literal["adamw", "sgd", "adam", "muon"]
+# LOSS_TYPES = Literal["cross_entropy", "kl_divergence"]
+# LOSS_REDUCTION_TYPES = Literal["none", "mean", "sum"]
+# TP_MODES = Literal["row", "column"]
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -59,7 +77,7 @@ class ParallelismConfig(BaseModel):
 
     enabled: bool = False
 
-    mode: Literal["single", "dp", "tp"]
+    mode: TpModes = "dp"
     world_size: int
     tp_size: int = 1
     dp_size: int = 1
@@ -73,7 +91,7 @@ class ParallelismConfig(BaseModel):
     n_heads_kv: int | None = None
     d_head_q: int | None = None
 
-    tp_mode: TP_MODES = "row"
+    tp_mode: TpModes = "row"
 
     @property
     def local_heads_q(self) -> int:
@@ -88,13 +106,13 @@ class ParallelismConfig(BaseModel):
         return self.n_heads_kv // self.tp_size
 
 class TokenizerConfig(BaseModel):
-    name: str = "yc_tok1"
+    name: str = "ic1_tok"
     dirname: Path = MODELS_FOLDER
     vocab_size: int | None = VOCAB_SIZE
     max_context: int | None = MAX_CONTEXT
     pat_str: str | None = PAT_STR_GPT2
     special_tokens: SpecialTokens | None = Field(default_factory=SpecialTokens)
-    source: TOKENIZER_SOURCES = "tiktoken"
+    source: TokenizerSources = "tiktoken"
 
     def model_post_init(self, context: Any) -> None:
         self.dirname = self.dirname / self.name
@@ -120,13 +138,13 @@ class TrainingTokenizerConfig(TokenizerConfig):
 class TransformerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tf_type: TF_TYPES = "dense"
+    tf_type: TfTypes = "dense"
 
     vocab_size: int = VOCAB_SIZE
     max_context: int = MAX_CONTEXT
     pad_id: int = -100
 
-    positional_encoding: POSITIONAL_ENCODING_TYPES = "rope" # Options: "positional", "rope"
+    positional_encoding: PositionalEncodingTypes = "rope" # Options: "positional", "rope"
 
     d_model: int = DIM_MODEL
     d_ffn: int = DIM_FFN  # 4 * dim_model
@@ -136,9 +154,9 @@ class TransformerConfig(BaseModel):
 
     dropout: float = DROPOUT
     norm_before_attn: bool = True
-    normalization: NORMALIZATION_TYPES = "rms"  # Options: "rms", "layer"
+    normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
 
-    attn_impl: ATTN_IMPL_TYPES = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not reccomended : "impl"
+    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not reccomended : "impl"
     enable_gqa: bool = False
 
     softcap: float = 18.0
@@ -163,15 +181,15 @@ class DenseTransformerConfig(TransformerConfig):
     pass
 
 class MoETransformerConfig(TransformerConfig):
-    tf_type: TF_TYPES = "moe"
+    tf_type: TfTypes = "moe"
     nb_experts: int = 16
     expert_capacity_factor: float = 1.0
 
 class ObjectiveConfig(BaseModel):
-    objective_fn: LOSS_TYPES = "cross_entropy"
+    objective_fn: LossTypes = "cross_entropy"
     kwargs: dict = Field(default_factory=dict)
     ignore_index: int = -100
-    reduction: LOSS_REDUCTION_TYPES = "none"
+    reduction: LossReductionTypes = "none"
 
 class GenerationConfig(BaseModel):
     max_length: int = 256
@@ -183,6 +201,59 @@ class GenerationConfig(BaseModel):
     num_return_sequences: int = 1
     stream: bool = False
     use_cache: bool = True
+
+class OptimizerSpec(BaseModel):
+    name: OptimizerNames = "adamw"
+    kwargs: dict = Field(default_factory=dict)
+
+class TrainingConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    batch_size: int = BATCH_SIZE
+    steps: int = 100000
+    accumulation_steps: int = 100
+
+    batch_size_scheduling: bool = False
+    max_learning_rate: float = MAX_LEARNING_RATE
+    min_learning_rate: float = MIN_LEARNING_RATE
+    warmup_iters: int = WARMUP_ITERS
+
+    optimizer: dict[str, OptimizerSpec] | OptimizerSpec | OptimizerNames | None = None # { "emb": Optimizer(...), "tf": Optimizer(...) } or single Optimizer or "opt_name" 
+    _optimizers: dict[str, OptimizerSpec] = PrivateAttr(default_factory=dict)
+
+    validation_step: int = VALIDATION_STEP
+    pretraining_val_ratio: float = PRETRAINING_VAL_RATIO
+
+    def model_post_init(self, context: Any) -> None:
+        opt: dict[str, OptimizerSpec] = dict()
+
+        if isinstance(self.optimizer, str):
+            if self.optimizer not in get_args(OptimizerNames):
+                raise ValueError(f"optimizer string must be one of {OptimizerNames}. Got {self.optimizer}.")
+            warnings.warn(f"Using a single optimizer for both embeddings and transformer layers. {self.optimizer} is used with default parameters: {opt_params[self.optimizer]}.")
+            self._optimizers = {
+                "emb": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
+                "tf": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer])
+            }
+        elif isinstance(self.optimizer, dict):
+            for key, value in self.optimizer.items():
+                if key not in {"emb", "tf", "lm_head", "lambdas"}: # emb, tf, lm_head, lambdas or TODO: 0-indexed layer number
+                    raise ValueError(f"optimizer dict keys must be 'emb' and/or 'tf'. Got {key}.")
+                if isinstance(value, OptimizerSpec):
+                    opt[key] = value
+                elif isinstance(value, str):
+                    opt[key] = OptimizerSpec(name=value, kwargs=opt_params[value])
+                else:
+                    raise ValueError(f"optimizer[{key}] must be str or OptimizerSpec. Got {type(value)}.")
+
+        elif isinstance(self.optimizer, OptimizerSpec):
+            opt["emb"] = self.optimizer
+            opt["tf"] = self.optimizer
+        else:
+            warnings.warn("No optimizer specified. Using default optimizers: AdamW for embeddings and Muon for transformer layers.")
+        
+        opt.setdefault("emb", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+        opt.setdefault("tf", OptimizerSpec(name="muon", kwargs=opt_params["muon"]))
+        self._optimizers = opt
 
 class GPTConfig(BaseModel):
     """
@@ -205,13 +276,14 @@ class GPTConfig(BaseModel):
     model_config = ConfigDict(
         json_encoders={Path: str}
     )
-    name: str = "yc1"
+    name: str = "ic1"
     tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     dirname: str | Path = MODELS_FOLDER
     model: TransformerConfig = Field(default_factory=TransformerConfig)
     objective: ObjectiveConfig = Field(default_factory=ObjectiveConfig)
-    dtype: DTYPES = "float32"
-    device: DEVICES = DEVICE
+    trainer: TrainingConfig = Field(default_factory=TrainingConfig)
+    dtype: Dtypes = "float32"
+    device: Devices = DEVICE
 
     def model_post_init(self, context: Any) -> None:
         if isinstance(self.dirname, str):
@@ -236,8 +308,6 @@ class GPTConfig(BaseModel):
             if self.model.max_context != self.tokenizer.max_context:
                 raise ValueError(f"Model max_context ({self.model.max_context}) does not match tokenizer max_context ({self.tokenizer.max_context})")
             
-        
-
         self.dtype = getattr(torch, self.dtype)
         self.device = torch.device(self.device)
 
@@ -305,21 +375,6 @@ class ModelCompletionOutput(ModelOutput):
     completions: List[str] | None = None
     done: bool = False
 
-class TrainingConfig(BaseModel):
-    batch_size: int = BATCH_SIZE
-    steps: int = 100000
-    accumulation_steps: int = 100
-
-    max_learning_rate: float = MAX_LEARNING_RATE
-    min_learning_rate: float = MIN_LEARNING_RATE
-    warmup_iters: int = WARMUP_ITERS
-
-    optimizer: OPTIMIZERS = "adamw"
-    optimizer_params: dict = Field(default_factory=dict)
-
-    validation_step: int = VALIDATION_STEP
-    pretraining_val_ratio: float = PRETRAINING_VAL_RATIO
-
 class TrainingState(BaseModel):
     step: int = 0
     best_val_loss: float = float("inf")
@@ -331,6 +386,18 @@ class TrainingResults(BaseModel):
     train_loss: List[float] = Field(default_factory=list)
     val_loss: List[float] = Field(default_factory=list)
     steps: List[int] = Field(default_factory=list)
+
+class TrainingMetrics(BaseModel):
+    time: List[float] = Field(default_factory=list)
+    step: List[int] = Field(default_factory=list)
+    tokens: List[int] = Field(default_factory=list)
+    epochs: List[int] = Field(default_factory=list)
+    accuracy: List[float] = Field(default_factory=list)
+    loss: List[float] = Field(default_factory=list)
+    val_accuracy: List[float] = Field(default_factory=list)
+    val_loss: List[float] = Field(default_factory=list)
+    best_val_loss: List[float] = Field(default_factory=list)
+    core: List[float] = Field(default_factory=list)
 
 def get_config_from_huggingface(model_name: str) -> TransformerConfig:
     model = AutoModelForCausalLM.from_pretrained(model_name)
