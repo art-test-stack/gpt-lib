@@ -95,6 +95,8 @@ class Transformer(Module):
         ))
         
         self.model_head = Linear(config.d_model, config.vocab_size, bias=False)
+        self.w_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers, dtype=dtype), requires_grad=True)
+        self.w_residual = torch.nn.Parameter(torch.zeros(self.config.n_layers, dtype=dtype), requires_grad=True)
 
         if self.config.normalization == "rms":
             self.norm = apply_rms_norm
@@ -121,18 +123,17 @@ class Transformer(Module):
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
 
         x = self.layers.emb(input_ids)
-
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
 
-        x = self.norm(x, eps=1e-8, torch_impl=True)
+        x = self.norm(x)
+        x0 = x.clone()
         attentions = []
-        for i, decoder_layer in enumerate(self.layers.blocks):
+        for i, layer in enumerate(self.layers.blocks):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.layers.blocks) - 1) and False
-            x, attn = decoder_layer(
-                x=x, 
-                attn_mask=attn_mask,
+            x = self.w_residual[i] * x + self.w_x0[i] * x0
+            x, attn = layer(x, attn_mask=attn_mask,
                 # TODO: not yet supported
                 kv_cache=kv_cache, 
                 # TODO: return_attn in special cases only -> interpretability
@@ -145,14 +146,17 @@ class Transformer(Module):
         if kv_cache is not None:
             kv_cache.advance()
 
-        x = self.norm(x, eps=1e-8, torch_impl=True)
+        x = self.norm(x)
 
         if return_hidden_states:
             hidden_states = x
 
         softcap = 18
         logits = self.model_head(x)
-        logits = torch.clamp(logits, min=-softcap, max=softcap)
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        
+        # logits = torch.clamp(logits, min=-softcap, max=softcap)
         
         return TransformerOutput(
             logits=logits,
@@ -196,7 +200,7 @@ class GPTModel:
         return ModelOutput(logits=logits, loss=loss)
 
     def __repr__(self) -> str:
-        return f"GPTModel(config={self.config}, model={self.model})"
+        return f"GPTModel(config={str(self.config)}, \nmodel={str(self.model)})"
     
     def eval(self) -> None:
         self.model.eval()

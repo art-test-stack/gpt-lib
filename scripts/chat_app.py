@@ -1,8 +1,7 @@
 import sys, os, load_dotenv
 load_dotenv.load_dotenv()
 try:
-    from gpt_lib.interface.chat import chatapp_interface
-    from gpt_lib.interface.benchmark import benchmark_interface
+    import gpt_lib
 except ImportError as e:
     print("Import Error:", e)
     if os.environ["ENV"] == "development":
@@ -11,10 +10,13 @@ except ImportError as e:
         parent_dir = os.path.dirname(os.path.dirname(current_dir))
         sys.path.append(parent_dir)
         print("Updated System Path:", sys.path)
-        from gpt_lib.interface.chat import chatapp_interface
-        from gpt_lib.interface.benchmark import benchmark_interface
+        import gpt_lib
     else:
         raise e
+
+from gpt_lib.interface.chat import chatapp_interface
+from gpt_lib.interface.benchmark import benchmark_interface
+from gpt_lib.utils.common import get_banner
 import gradio as gr
 from pydantic import BaseModel
 
@@ -41,4 +43,6 @@ with gr.Blocks(title="GPT-lib") as app:
 
 
 if __name__ == "__main__":
+    print("Launching GPT-lib Interface...")
+    print(get_banner())
     app.launch()
