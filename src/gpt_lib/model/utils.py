@@ -72,7 +72,6 @@ class KVCache:
     @torch.no_grad()
     def reset(self, *args):
         self.cur_pos = 0
-        self = self.__init__(*args)
 
     @torch.no_grad()
     def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int):

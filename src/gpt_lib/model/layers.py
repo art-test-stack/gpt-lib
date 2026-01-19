@@ -3,34 +3,20 @@ from gpt_lib.utils.schemas import (
 )
 from gpt_lib.utils.types import AttnImplTypes, NormalizationTypes
 from gpt_lib.utils.default import DEVICE, DEVICE_NAME
+from gpt_lib.utils.import_utils import is_torch_cuda_available, is_flash_attn3_available_from_kernel
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional, Union
 import warnings
 
-# -------------- Check for optional dependencies -------------- #
-try:
-    import flash_attn
-    _flash_attention_installed = True
-except ImportError:
-    flash_attn = None
-    _flash_attention_installed = False
-try: 
-    from kernels import get_kernels
-    flash_attn3 = get_kernels('varunneal/flash-attention-3').flash_attn_interface
-    _kernels_installed = True
-except ImportError:
-    kernels = None
-    flash_attn3 = None
-    _kernels_installed = False
 
 # -------------- Positional Encoding utilities -------------- #
 
-def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.dtype = torch.float32, device: torch.device | None = None) -> torch.Tensor:
+def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
     if not device:
         warnings.warn(f"Device not specified for RoPE precomputation. Using default device {DEVICE_NAME}.")
         device = DEVICE
@@ -43,7 +29,7 @@ def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.d
     rope_cache = torch.stack((torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)), dim=-1)
     return rope_cache # seq_len x (d_head/2) x 2
 
-def precompute_positional_encoding(n_pos: int, d_model: int, dtype: torch.dtype = torch.float32, device: torch.device | None = None) -> torch.Tensor:
+def precompute_positional_encoding(n_pos: int, d_model: int, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
     if not device:
         warnings.warn("Device not specified for positional encoding precomputation. Using default device.")
         device = torch.device(DEVICE)
@@ -200,6 +186,20 @@ class TPLinear(Linear):
         dist.all_reduce(out, group=self.tp_spec.tp_group)
         return out
 
+# --------------  Value Embedding utilities -------------- #
+
+def has_ve(layer_idx: int, n_layers: int) -> bool:
+    '''Determine if a layer should have value embeddings (ResFormer-style).
+    Value embeddings are applied to alternating layers, with the last layer always included.
+    '''
+    # TODO: Make value embeddings 
+    # https://arxiv.org/abs/2212.00776
+    return False
+    if layer_idx == n_layers - 1:
+        return True
+    return layer_idx % 2 == 0
+
+
 # --------------      Attention utilities      -------------- #
 
 def scaled_dot_product_attention(
@@ -209,10 +209,10 @@ def scaled_dot_product_attention(
         attn_mask: torch.Tensor | None = None, 
         dropout_p: float = 0.0,
         is_causal: bool = False, 
-        scale: float | None = None, 
+        scale: Optional[float] = None, 
         enable_gqa: bool = False,
         return_attn_weights: bool = False,
-        device: torch.device | str | None = None
+        device: Optional[torch.device | str] = None
     ) -> torch.Tensor:
     if device is None:
         device = query.device
@@ -262,6 +262,43 @@ def scaled_dot_product_attention(
     attn_weight = F.dropout(attn_weight, dropout_p, training=True)
     return attn_weight @ value, attn_weight if return_attn_weights else None
 
+def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                          window_size=(-1, -1), alibi_slopes=None, deterministic=False):
+    pass
+
+def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+                window_size=(-1, -1), alibi_slopes=None, deterministic=False):
+    pass
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor, # (B, T, H, D)
+    k_cache: torch.Tensor, # (Bc, Tc, Hkv, D)
+    v_cache: torch.Tensor, # (Bc, Tc, Hkv, D)
+    k: Optional[torch.Tensor] = None, # (B, T_new, Hkv, D)
+    v: Optional[torch.Tensor] = None, # (B, T_new, Hkv, D)
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    rotary_interleaved=True,
+    alibi_slopes=None,
+):
+    pass
+
+if is_torch_cuda_available():
+    if is_flash_attn3_available_from_kernel():
+        import kernels
+        flash_attn = kernels.get_kernels('varunneal/flash-attention-3').flash_attn_interface
+        flash_attn_qkvpacked_func = flash_attn.flash_attn_qkvpacked
+        flash_attn_func = flash_attn.flash_attn_func
+        flash_attn_with_kvcache = flash_attn.flash_attn_with_kvcache
+
+_flash_attention_installed = True
+
 class FusedQKVProjection(Module):
     """
     Purpose: project input tensor to Q, K, V in a single linear layer for efficiency. 
@@ -304,7 +341,7 @@ def build_qkv_projection(d_model: int, n_heads_q: int, n_heads_kv: int, d_head: 
         return QKVProjection(d_model, n_heads_q, n_heads_kv, d_head, bias=bias)
 
 class CausalSelfAttention(Module):
-    def __init__(self, dim_model: int, n_heads: int, d_head: int, 
+    def __init__(self, dim_model: int, n_heads: int, n_kv_heads: int, d_head: int, 
                  norm_before_attn: bool, enable_gqa: bool, dropout: float = .0, 
                  normalization: NormalizationTypes = "rms",
                  attn_impl: AttnImplTypes = "sdpa", layer_idx: int = 0
@@ -471,6 +508,7 @@ class DecoderLayer(Module):
             dim_model: int, 
             dim_ffn: int, 
             n_heads: int, 
+            n_kv_heads: int,
             d_head: int, 
             dropout: float,
             attn_impl: AttnImplTypes = "sdpa",
@@ -485,6 +523,7 @@ class DecoderLayer(Module):
         self.attention = CausalSelfAttention(
             dim_model=dim_model, 
             n_heads=n_heads, 
+            n_kv_heads=n_kv_heads,
             d_head=d_head, 
             enable_gqa=enable_gqa,
             normalization=normalization,
@@ -515,7 +554,7 @@ class DecoderLayer(Module):
         return output, self_attn
 
 class MixtureOfExpertsLayer(Module):
-    '''Mixture of Experts layer. Note: This is a simplified version without load balancing or capacity constraints. '''
+    '''Mixture of Experts layer. Note: This is a naive version without load balancing or capacity constraints. '''
     def __init__(
             self, 
             dim_model: int, 
@@ -524,7 +563,7 @@ class MixtureOfExpertsLayer(Module):
             dropout: float
         ) -> None:
         super().__init__()
-        warnings.warn("This is a simplified Mixture of Experts layer without load balancing or capacity constraints. Use with caution.", UserWarning)
+        warnings.warn("This is a naive Mixture of Experts layer without load balancing or capacity constraints. Use with caution.", UserWarning)
         self.experts = nn.ModuleList([
             FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
             for _ in range(n_experts)

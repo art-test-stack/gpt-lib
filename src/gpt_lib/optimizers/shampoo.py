@@ -6,7 +6,7 @@ Reference:
 """
 import torch
 
-from gpt_lib.utils.types import OptFloat, OptLossClosure, Params
+from gpt_lib.utils.types import OptFloat, OptLossClosure, TParams
 
 
 def _matrix_power(matrix: torch.Tensor, power: float) -> torch.Tensor:
@@ -48,7 +48,7 @@ class Shampoo(torch.optim.Optimizer):
 
     def __init__(
         self,
-        params: Params,
+        params: TParams,
         lr: float = 1e-1,
         momentum: float = 0.0,
         weight_decay: float = 0.0,
@@ -77,15 +77,15 @@ class Shampoo(torch.optim.Optimizer):
         )
         super(Shampoo, self).__init__(params, defaults)
 
-    def step(self, closure: OptLossClosure = None) -> OptFloat:
+    def step(self) -> OptFloat:
         """Performs a single optimization step.
 
         Arguments:
             closure: A closure that reevaluates the model and returns the loss.
         """
-        loss = None
-        if closure is not None:
-            loss = closure()
+        # loss = None
+        # if closure is not None:
+        #     loss = closure()
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -148,4 +148,4 @@ class Shampoo(torch.optim.Optimizer):
                 state["momentum_buffer"] = grad
                 p.data.add_(grad, alpha=-group["lr"])
 
-        return loss
+        # return loss

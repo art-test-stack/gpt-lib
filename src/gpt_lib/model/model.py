@@ -18,6 +18,7 @@ from gpt_lib.utils.schemas import (
     ModelCompletionOutput,
     TransformerConfig, 
     TransformerOutput, 
+    OptimizerSpec
 )
 from gpt_lib.utils.types import Dtypes, Devices, TokenizerTensors
 from gpt_lib.utils.default import MODELS_FOLDER, DEVICE
@@ -36,7 +37,7 @@ import warnings
 class Transformer(Module):
     def __init__(
             self,
-            config: TransformerConfig = TransformerConfig(),
+            config: TransformerConfig,
             device: str | torch.device = DEVICE,
             dtype: torch.dtype = torch.float32,
         ) -> None:
@@ -45,7 +46,9 @@ class Transformer(Module):
             device = torch.device(device)
         self.config = config
         self.vocab_size = config.vocab_size
-        self.padding_idx = config.pad_id
+        self.pad_token_id = config.pad_id
+        # self.bos_token_id = config.bos_id
+        # self.eos_token_id = config.eos_id
         self.device = device
         self.dtype = dtype
         if self.config.positional_encoding == "rope":
@@ -69,7 +72,7 @@ class Transformer(Module):
         embedding = nn.Embedding(
             num_embeddings = config.vocab_size, 
             embedding_dim = config.d_model, 
-            padding_idx = config.pad_id,
+            pad_token_id = config.pad_id,
             sparse=False,
             device=device,
             dtype=dtype
@@ -82,6 +85,7 @@ class Transformer(Module):
                     dim_model=config.d_model,
                     dim_ffn=config.d_ffn, 
                     n_heads=config.n_heads, 
+                    n_kv_heads=config.n_kv_heads,
                     d_head=config.d_head, 
                     dropout=config.dropout,
                     layer_idx=layer_idx,
@@ -94,9 +98,15 @@ class Transformer(Module):
             ])
         ))
         
-        self.model_head = Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.d_model, config.vocab_size, bias=False)
         self.w_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers, dtype=dtype), requires_grad=True)
-        self.w_residual = torch.nn.Parameter(torch.zeros(self.config.n_layers, dtype=dtype), requires_grad=True)
+        self.w_res = torch.nn.Parameter(torch.zeros(self.config.n_layers, dtype=dtype), requires_grad=True)
+
+        # TODO: Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # head_dim = config.d_model // config.n_heads
+        # kv_dim = config.n_kv_heads * head_dim
+        # padded_vocab_size = config.vocab_size
+        # self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layers) if has_ve(i, config.n_layers)})
 
         if self.config.normalization == "rms":
             self.norm = apply_rms_norm
@@ -114,6 +124,7 @@ class Transformer(Module):
             return_hidden_states: bool = False,
         ):
         assert (kv_cache is None) or (not self.training), "KV cache can not be used during training."
+        B, T = input_ids.size()
 
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
@@ -122,17 +133,17 @@ class Transformer(Module):
         assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
 
-        x = self.layers.emb(input_ids)
+        x = self.emb(input_ids)
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
 
         x = self.norm(x)
         x0 = x.clone()
         attentions = []
-        for i, layer in enumerate(self.layers.blocks):
+        for i, layer in enumerate(self.blocks, 0):
             # TODO: not return attn yet
-            return_attn = return_attentions and (i == len(self.layers.blocks) - 1) and False
-            x = self.w_residual[i] * x + self.w_x0[i] * x0
+            return_attn = return_attentions and (i == len(self.blocks) - 1) and False
+            x = self.w_res[i] * x + self.w_x0[i] * x0
             x, attn = layer(x, attn_mask=attn_mask,
                 # TODO: not yet supported
                 kv_cache=kv_cache, 
@@ -151,8 +162,8 @@ class Transformer(Module):
         if return_hidden_states:
             hidden_states = x
 
-        softcap = 18
-        logits = self.model_head(x)
+        softcap = self.config.softcap
+        logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
         
@@ -164,6 +175,19 @@ class Transformer(Module):
             hidden_states=hidden_states if return_hidden_states else None,
             kv_cache=kv_cache
         )
+
+    def resize_token_embeddings(self, new_size: int) -> None:
+        # TODO: Dummy implementation, to be improved
+        self.emb = nn.Embedding(
+            num_embeddings = new_size, 
+            embedding_dim = self.config.d_model, 
+            pad_token_id = self.config.pad_id,
+            sparse=False,
+            device=self.device,
+            dtype=self.dtype
+        )
+        self.vocab_size = new_size
+        self.lm_head = Linear(self.config.d_model, new_size, bias=False)
     
 
 class GPTModel:
@@ -171,7 +195,7 @@ class GPTModel:
             self,
             model: torch.nn.Module,
             tokenizer: callable,
-            config: GPTConfig = GPTConfig()
+            config: GPTConfig
         ) -> None:
         super().__init__()
         self.config = config
@@ -184,10 +208,15 @@ class GPTModel:
         self.attn_mask = SelfAttentionMask(pad_idx=config.model.pad_id, max_context=config.model.max_context)
 
         assert self.model is not None, "Model must be provided"
-        assert all(hasattr(self.model, attr) for attr in ["config", "padding_idx", "vocab_size"]), "Model must have config, padding_idx and vocab_size attributes"
-        assert self.model.padding_idx == self.tokenizer.pad_token_id, "Tokenizer pad token id must match model pad id"
+        assert all(hasattr(self.model, attr) for attr in ["config", "pad_token_id", "vocab_size"]), "Model must have config, pad_token_id and vocab_size attributes"
+        assert self.model.pad_token_id == self.tokenizer.pad_token_id, "Tokenizer pad token id must match model pad id"
         assert self.model.vocab_size == self.tokenizer.vocab_size, "Model vocab size must match tokenizer vocab size"
-        assert self.model.padding_idx == self.config.objective.ignore_index, "Objective ignore index must match model pad id"
+        assert self.model.pad_token_id == self.config.objective.ignore_index, "Objective ignore index must match model pad id"
+
+        self.vocab_size = self.config.model.vocab_size
+        self.pad_token_id = self.config.model.pad_id
+        self.bos_token_id = self.config.model.bos_id
+        self.eos_token_id = self.config.model.eos_id
     
     def __call__(self, input_ids, labels=None, *args, **kwargs) -> ModelOutput:
         input_ids = input_ids.to(self.config.device)
@@ -243,6 +272,7 @@ class GPTModel:
 
     def apply_chat_template(self, messages: List[dict], template: str) -> str:
         return self.tokenizer.apply_chat_template(messages, template)
+
 
     def forward(
             self, 
@@ -322,55 +352,12 @@ class GPTModel:
         if generation_config.use_cache:
             kv_cache = KVCache(
                 batch_size=input_ids.size(0),
-                n_layers=self.config.model.n_layers,
+                n_layerss=self.config.model.n_layerss,
                 n_heads=self.config.model.n_heads,
                 d_head=self.config.model.d_head,
                 max_seq_len=generation_config.max_length
             )
-        for _ in range(generation_config.max_length):
-            inputs = generated[:, -generation_config.max_length:]
-            output: ModelOutput = self(
-                inputs, 
-                label_ids=label_ids,
-                temperature=generation_config.temperature,
-                kv_cache=kv_cache if generation_config.use_cache else None,
-                attentions=False
-            )
-            next_token_logits = output.logits[:, -1, :] / generation_config.temperature
-            filtered_logits = self.top_k_top_p_filtering(
-                next_token_logits, top_k=generation_config.top_k, top_p=generation_config.top_p
-            )
-
-            probabilities = nn.functional.softmax(filtered_logits, dim=-1)
-
-            next_token = torch.multinomial(probabilities, num_samples=1)
-
-            generated = torch.cat((generated, next_token), dim=1)
-
-            if generation_config.stream:
-                # During streaming, yield intermediate outputs
-                yield ModelCompletionOutput(
-                    logits=output.logits,
-                    loss=output.loss,
-                    log_probs=output.log_probs,
-                    completions=[
-                        self.tokenizer.decode(generated[i].tolist()) for i in range(generated.size(0))
-                    ],
-                    kv_cache=output.kv_cache,
-                    done=False
-                )
-
-        output = ModelCompletionOutput(
-            logits=output.logits,
-            loss=output.loss,
-            log_probs=output.log_probs,
-            completions=[
-                self.tokenizer.decode(generated[i].tolist()) for i in range(generated.size(0))
-            ],
-            kv_cache=output.kv_cache,
-            done=True
-        )
-        return output
+        pass 
 
     # TODO
     def generate_batch(self):
@@ -398,12 +385,27 @@ class GPTModel:
     
     def build_optimizer(self) -> torch.optim.Optimizer:
         # TODO: return optimizer based on config
-        opt_config = self.config.trainer._optimizers
+        opt_config: dict[str, OptimizerSpec] = self.config.trainer._optimizers
 
-        # kwargs = {
-        #     "emb": { self.model.emb.parameters(), opt_config["emb"].kwargs },
-        # }
+        emb_params = list(self.model.emb.parameters())
+        tf_params = list(self.model.blocks.parameters())
+        params = {
+            key: { "params": self.model.__getattr__(key).parameters(), **opt_config[key].kwargs }
+            for key in opt_config.keys()
+        }
+        optimizers = [
+            opt_config[key].optimizer_class(**value["kwargs"])
+            for key, value in params.items()
+        ]
         
+    @property
+    def tp_plan(self) -> dict:
+        # TODO
+        try:
+            return self.model.tp_plan
+        except AttributeError:
+            warnings.warn("Model does not have tp_plan attribute. Returning empty dict.", UserWarning)
+            return {}
     
     @classmethod
     def from_pretrained(

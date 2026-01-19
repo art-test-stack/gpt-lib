@@ -118,9 +118,9 @@ class Trainer:
     def save_model(self, path: Path) -> None:
         if not path.exists():
             path.mkdir()
-        torch.save(self.model.state_dict(), path.joinpath("model.pt"))
-        torch.save(self.optimizer.state_dict(), path.joinpath("optimizer.pt"))
-
+        self.model.save_checkpoint(path.joinpath("model.pt"))
+        self.optimizer.save_checkpoint(path.joinpath("optimizer.pt"))
+        
         if SAVE_ON_DRIVE:
             pass
 
@@ -191,3 +191,4 @@ class Trainer:
 
     def _validation_step(self):
         pass
+

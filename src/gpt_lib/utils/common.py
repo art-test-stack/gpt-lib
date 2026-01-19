@@ -23,7 +23,7 @@ def print0(*values, **kwargs):
     if rank == 0:
         print(*values, **kwargs)
 
-def print_banner():
+def get_banner(to_print: bool = False) -> str:
     """Banner made with https://manytools.org/hacker-tools/ascii-banner/"""
     banner1 = """
       .-_'''-.   .-------. ,---------.   .---.    .-./`)  _______    
@@ -47,7 +47,8 @@ _/~~~~~~~\_/~~\__________/~~\______________/~~~~~~~~\_/~~~~\_/~~~~~~~\__
 ______/~~\______________________________________________________________
 """
     banner = random.choice([banner1, banner2])
-    print0(banner)
+    if to_print:
+        print0(banner)
     return banner
 
 class DummyWandb:

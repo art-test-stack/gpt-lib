@@ -49,7 +49,7 @@ class MuON(optim.Optimizer):
             warmup_steps: int = WARMUP_ITERS,
             decay_steps: int = DECAY_ITERS,
             weight_decay: float = WEIGHT_DECAY,
-            beta1: float = BETA_1,
+            betas: float = BETA_1,
             beta2: float = BETA_2,
             epsilon: float = EPSILON,
             **kwargs

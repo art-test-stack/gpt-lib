@@ -143,21 +143,37 @@ class TransformerConfig(BaseModel):
     vocab_size: int = VOCAB_SIZE
     max_context: int = MAX_CONTEXT
     pad_id: int = -100
+    bos_id: int = -100
+    eos_id: int = -100
 
     positional_encoding: PositionalEncodingTypes = "rope" # Options: "positional", "rope"
+
+    # TODO: Same structure as transformers.RopeParameters for huggingface compatibility
+    # https://huggingface.co/docs/transformers/v5.0.0rc1/internal/rope_utils
+    rope_params: dict = Field(default_factory=lambda: {"rope_theta": 10_000, "rope_type": "default"})  # Used if positional_encoding is "rope"
 
     d_model: int = DIM_MODEL
     d_ffn: int = DIM_FFN  # 4 * dim_model
     n_heads: int = NUM_HEADS
+    n_kv_heads: int = NUM_HEADS  # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
 
     dropout: float = DROPOUT
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
+    norm_eps: float = 1e-8
+    hidden_act: str = "gelu" # TODO: make it compatible with model.Transformer implementation
 
-    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not reccomended : "impl"
+    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
     enable_gqa: bool = False
+
+    # Sliding window attention pattern string, tiled across layers. Final layer always L.
+    # Characters: L=long (full context), S=short (half context)
+    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
+    # Based on: https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py
+    window_pattern: str = "SSSL" 
+    window_size: int = 256  # Size of short window
 
     softcap: float = 18.0
     
@@ -206,6 +222,15 @@ class OptimizerSpec(BaseModel):
     name: OptimizerNames = "adamw"
     kwargs: dict = Field(default_factory=dict)
 
+    def optimizer_class(self) -> Any:
+        # TODO: change it to include custom optimizers
+        import gpt_lib.optimizers.optim as optim_module
+        opt_class = optim_module.opt_class.get(self.name, None)
+        if opt_class is not None:
+            return opt_class
+        if self.name not in optim_module.opt_class:
+            raise ValueError(f"Optimizer '{self.name}' is not recognized. Available optimizers: {list(optim_module.opt_class.keys())}")
+
 class TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     batch_size: int = BATCH_SIZE
@@ -224,6 +249,7 @@ class TrainingConfig(BaseModel):
     pretraining_val_ratio: float = PRETRAINING_VAL_RATIO
 
     def model_post_init(self, context: Any) -> None:
+        # TODO: TODO: 0-indexed layer number
         opt: dict[str, OptimizerSpec] = dict()
 
         if isinstance(self.optimizer, str):
@@ -232,11 +258,14 @@ class TrainingConfig(BaseModel):
             warnings.warn(f"Using a single optimizer for both embeddings and transformer layers. {self.optimizer} is used with default parameters: {opt_params[self.optimizer]}.")
             self._optimizers = {
                 "emb": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-                "tf": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer])
+                "tf": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
+                "lm_head": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
+                "w_x0": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
+                "w_res": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
             }
         elif isinstance(self.optimizer, dict):
             for key, value in self.optimizer.items():
-                if key not in {"emb", "tf", "lm_head", "lambdas"}: # emb, tf, lm_head, lambdas or TODO: 0-indexed layer number
+                if key not in {"emb", "tf", "lm_head", "w_x0", "w_res"}: # emb, tf, lm_head, w_x0, w_res layers
                     raise ValueError(f"optimizer dict keys must be 'emb' and/or 'tf'. Got {key}.")
                 if isinstance(value, OptimizerSpec):
                     opt[key] = value
@@ -246,14 +275,29 @@ class TrainingConfig(BaseModel):
                     raise ValueError(f"optimizer[{key}] must be str or OptimizerSpec. Got {type(value)}.")
 
         elif isinstance(self.optimizer, OptimizerSpec):
+            warnings.warn(f"Using a single optimizer for both embeddings and transformer layers. {self.optimizer.name} is used with specified parameters: {self.optimizer.kwargs}.")
             opt["emb"] = self.optimizer
             opt["tf"] = self.optimizer
+            opt["head"] = self.optimizer
+            opt["w_x0"] = self.optimizer
+            opt["w_res"] = self.optimizer
         else:
             warnings.warn("No optimizer specified. Using default optimizers: AdamW for embeddings and Muon for transformer layers.")
         
         opt.setdefault("emb", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
         opt.setdefault("tf", OptimizerSpec(name="muon", kwargs=opt_params["muon"]))
+        opt.setdefault("head", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+        opt.setdefault("w_x0", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+        opt.setdefault("w_res", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+        opt.setdefault("ve", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+
         self._optimizers = opt
+    
+    def optimizer_class(self, part: str) -> torch.optim.Optimizer:
+        if part not in self._optimizers:
+            raise ValueError(f"No optimizer specified for part '{part}'. Available parts: {list(self._optimizers.keys())}.")
+        return self._optimizers[part].optimizer_class()
+    
 
 class GPTConfig(BaseModel):
     """
