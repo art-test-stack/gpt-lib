@@ -1,4 +1,4 @@
-from packaging import version as pkg_version
+from packaging import version
 from functools import lru_cache
 
 
@@ -49,11 +49,11 @@ def is_torch_xpu_available() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 @lru_cache() 
-def is_torch_greater_or_equal(version: str) -> bool:
+def is_torch_greater_or_equal(vers: str) -> bool:
     if not is_torch_available():
         return False
     import torch
-    return pkg_version(torch.__version__) >= pkg_version(version)
+    return version.parse(torch.__version__) >= version.parse(vers)
 
 @lru_cache()
 def is_torch_bf16_gpu_available() -> bool:

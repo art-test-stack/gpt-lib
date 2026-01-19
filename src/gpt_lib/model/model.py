@@ -70,9 +70,9 @@ class Transformer(Module):
 
         # TODO: Will change to customed embedding
         embedding = nn.Embedding(
-            num_embeddings = config.vocab_size, 
-            embedding_dim = config.d_model, 
-            pad_token_id = config.pad_id,
+            num_embeddings=config.vocab_size, 
+            embedding_dim=config.d_model, 
+            padding_idx=config.pad_id,
             sparse=False,
             device=device,
             dtype=dtype
@@ -133,16 +133,16 @@ class Transformer(Module):
         assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
 
-        x = self.emb(input_ids)
+        x = self.layers.emb(input_ids)
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
 
         x = self.norm(x)
         x0 = x.clone()
         attentions = []
-        for i, layer in enumerate(self.blocks, 0):
+        for i, layer in enumerate(self.layers.blocks, 0):
             # TODO: not return attn yet
-            return_attn = return_attentions and (i == len(self.blocks) - 1) and False
+            return_attn = return_attentions and (i == len(self.layers.blocks) - 1) and False
             x = self.w_res[i] * x + self.w_x0[i] * x0
             x, attn = layer(x, attn_mask=attn_mask,
                 # TODO: not yet supported
