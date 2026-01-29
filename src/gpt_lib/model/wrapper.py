@@ -6,7 +6,6 @@ from gpt_lib.utils.schemas import (
     TokenizerConfig,
     TransformerConfig,
 )
-from gpt_lib.model.model import GPTModel
 
 def init_mistral_model(model_name="mistralai/Mistral-7B-Instruct-v0.1", device="cpu"):
     # raise NotImplementedError("WIP. Mistral model initialization is not yet supported.")
@@ -16,12 +15,12 @@ def init_mistral_model(model_name="mistralai/Mistral-7B-Instruct-v0.1", device="
         raise ValueError("Model name should start with 'mistralai/'")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    _model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         device_map="auto"
     ).to(device)
-    config: MistralConfig = _model.config
+    config: MistralConfig = model.config
     transformer_config = TransformerConfig(
         vocab_size=config.vocab_size,
         d_model=config.hidden_size,
@@ -53,9 +52,7 @@ def init_mistral_model(model_name="mistralai/Mistral-7B-Instruct-v0.1", device="
         objective=None,  # objective can be defined as needed
         dirname=""  # directory can be set as needed
     )
-    model = GPTModel(model=model, tokenizer=tokenizer, config=gpt_config)
-
-    return model
+    return model, tokenizer, gpt_config
 
 class HFModelWrapper:
     def __init__(self, model_name="openai-community/gpt2", device="cpu"):

@@ -2,6 +2,63 @@ import torch
 import warnings
 
 from gpt_lib.utils.default import DEVICE
+from gpt_lib.utils.schemas import TransformerConfig
+
+from typing import Iterable, Optional
+
+
+# -------------- Positional Encoding utilities -------------- #
+
+def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
+    if not device:
+        warnings.warn(f'Device not specified for RoPE precomputation. Using default device {DEVICE}.')
+        device = DEVICE
+    assert d_head % 2 == 0, 'd_head must be even for RoPE'
+    channel_range = torch.arange(0, d_head, 2.0, dtype=dtype, device=device)
+    inv_freq = 1.0 / (base ** (channel_range / d_head))
+    pos_seq = torch.arange(0, seq_len, dtype=dtype, device=device)
+
+    sinusoid_inp = torch.einsum('i,j->ij', pos_seq, inv_freq)
+    rope_cache = torch.stack((torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)), dim=-1)
+    return rope_cache # seq_len x (d_head/2) x 2
+
+def precompute_positional_encoding(n_pos: int, d_model: int, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
+    if not device:
+        warnings.warn('Device not specified for positional encoding precomputation. Using default device.')
+        device = torch.device(DEVICE)
+    pos = torch.arange(n_pos, dtype=dtype, device=device)
+    i = torch.arange(d_model, dtype=dtype, device=device)
+
+    pos_enc = torch.ger(pos, 1e4 ** (- 2 * (i//2) / d_model))
+
+    pos_enc[:, 0::2] = torch.sin(pos_enc[:, 0::2])
+    pos_enc[:, 1::2] = torch.cos(pos_enc[:, 1::2]) 
+    return pos_enc
+
+def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor, pairwise_split: bool = True) -> torch.Tensor:
+    assert x.dim() == 4, 'Input tensor x must be of shape (batch_size, n_heads, seq_len, d_head)'
+    sin, cos = rope_cache[..., 0], rope_cache[..., 1]
+    sin = sin.unsqueeze(0).unsqueeze(0).to(x.device)
+    cos = cos.unsqueeze(0).unsqueeze(0).to(x.device)
+    if pairwise_split:
+        x1, x2 = x[..., ::2], x[..., 1::2]
+    else:
+        x1, x2 = x[..., :x.size(-1)//2], x[..., x.size(-1)//2:]
+    batch, n_heads, seq_len, d_head = x.shape
+    assert x1.shape == x2.shape == (batch, n_heads, seq_len, d_head // 2), f'Unexpected shapes: x1 {x1.shape}, x2 {x2.shape}'
+
+    _x1 = x1 * cos - x2 * sin
+    _x2 = - x1 * sin + x2 * cos
+    x = torch.stack([_x1, _x2], dim=-1).reshape_as(x)
+    # x_rotated = torch.stack([-x2, x1], dim=-1).reshape_as(x)
+    # x = x * cos + x_rotated * sin
+    return x
+
+
+def apply_positional_encoding(x: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
+    return pos_enc[:,:x.size(-1)]
+
+# -------------- Attention Mask utilities -------------- #
 
 class SelfAttentionMask:
     def __init__(self, pad_idx: int = -100, max_context: int = 512) -> None:
@@ -52,64 +109,146 @@ class SelfAttentionMask:
             self.base_mask.requires_grad = False
         self.max_context = max_context
 
+# -------------- KV Cache utilities -------------- #
+
 class RowState:
     def __init__(self) -> None:
         self.in_python_block = False
         self.python_expr_tokens = []
         self.completed = False
 
+class StaticKVCache:
+    def __init__(self) -> None:
+        pass # TODO: implement static KV cache for non-streaming scenarios
+
 class KVCache:
     def __init__(
             self, 
-            batch_size: int, n_layers: int, n_heads: int, d_head: int, max_seq_len: int,
-            device: torch.device = DEVICE, 
-            dtype: torch.dtype = torch.float32 # TODO: change to flexible dtype
+            ddp_cache_data: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None,
+            config: Optional[TransformerConfig] = None,
+            # offloading: bool = False, # To mimic huggingface.DynamicCache' signature
+            # offload_only_non_sliding: bool = False, # To mimic huggingface.DynamicCache' signature
+            *args, **kwargs
         ) -> None:
-        self.shape = (n_layers, 2, batch_size, n_heads, max_seq_len, d_head)
-        self.cache = torch.empty(self.shape, device=device, dtype=dtype)
+        device = torch.device("meta")
+        dtype = torch.float32
+        if ddp_cache_data is not None:
+            device = ddp_cache_data[0][0].device
+            dtype = ddp_cache_data[0][0].dtype
+            pass # TODO: load from ddp_cache_data
+
+
+        self.n_layers = config.n_layers
+        self.n_heads = config.n_kv_heads
+        self.d_head = config.d_head
+        # This cache is dynamic -> no limit on context. Fix later if it is an issue
+        # self.max_context = config.max_context # TODO: make it dynamic -> 1 to max_context
+        self.batch_size = None
+
+        # easier to manage B, T, H, D shapes
         self.cur_pos = 0
+
+        # _cache = lambda: torch.zeros(0, 0, self.n_heads, self.d_head, device=device, dtype=dtype)
+
+        # default_cache = [
+        #     [_cache(), _cache()] for _ in range(self.n_layers)
+        # ]
+        # self.cache = ddp_cache_data or default_cache
+        # try with cache fully torch.tensor
+        self.cache = torch.empty(
+            (self.n_layers, 2, 0, 0, self.n_heads, self.d_head),
+            device=device,
+            dtype=dtype
+        )   # L, 2, B, T, H, D
 
     @torch.no_grad()
     def reset(self, *args):
         self.cur_pos = 0
 
+    @property
+    def device(self) -> torch.device:
+        return self.cache.device
+
+    @property
+    def shape(self) -> tuple:
+        return self.cache.shape
+    
+    @property
+    def k_shape(self) -> tuple:
+        # debug purpose
+        return self.cache[:,0].shape
+    
+    @property
+    def v_shape(self) -> tuple:
+        # debug purpose
+        return self.cache[:,1].shape
+    
+    @property
+    def seqlens(self) -> torch.Tensor:
+        # flash attention compatibility
+        # temporary fix for meta device
+        if self.device == torch.device("meta"):
+            return torch.tensor([self.cur_pos] * (self.batch_size if self.batch_size else 1))
+        return torch.tensor([self.cur_pos] * (self.batch_size if self.batch_size else 1), device=self.cache[0][0].device)
+    
+    @torch.no_grad()
+    def layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # TODO: make an interator? -> yield self.cache[layer_idx] / prefill next position in seqlen dim
+        assert layer_idx < self.shape[0], f"Layer index out of bounds: {layer_idx} >= {self.shape[0]}"
+        return self.cache[layer_idx]
+    
     @torch.no_grad()
     def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int):
-        assert k.shape == (self.shape[2], self.shape[3], self.shape[5]), f"Keys shape mismatch: {k.shape} != {(self.shape[2], self.shape[3], self.shape[5])}"
-        assert v.shape == (self.shape[2], self.shape[3], self.shape[5]), f"Values shape mismatch: {v.shape} != {(self.shape[2], self.shape[3], self.shape[5])}"
-        assert layer_idx < self.shape[0], f"Layer index out of bounds: {layer_idx} >= {self.shape[0]}"
-        assert self.cur_pos < self.shape[4], f"Current position out of bounds: {self.cur_pos} >= {self.shape[4]}"
-
-        if k.device != self.cache.device:
+        B, T, H, D = k.shape
+        if self.device != k.device:
             self.cache = self.cache.to(k.device)
+        
+        self.check_sizes(B, T, k.device, k.dtype)
+        
+        assert k.shape == v.shape, f"Key axnd Value tensors must have the same shape. Got k: {k.shape}, v: {v.shape}."
+        assert layer_idx < self.shape[0], f"Layer index out of bounds: {layer_idx} >= {self.shape[0]}"
+
         if k.dtype != self.cache.dtype:
             self.cache = self.cache.to(dtype=k.dtype)
         
-        self.cache[layer_idx, 0, :, :, self.cur_pos, :] = k
-        self.cache[layer_idx, 1, :, :, self.cur_pos, :] = v
+        self.cache[layer_idx,0,:,self.cur_pos:self.cur_pos+T,:,:] = k
+        self.cache[layer_idx,1,:,self.cur_pos:self.cur_pos+T,:,:] = v
+        return self.cache[layer_idx,0,:,:self.cur_pos+T,:,:], self.cache[layer_idx,1,:,:self.cur_pos+T,:,:]
+    
+    def check_sizes(self, bs, seqlen, device, dtype) -> None:
+        # Initialize cache if not done yet
+        if self.batch_size is None:
+            self.batch_size = bs
+            self.cache = torch.empty((
+                self.n_layers, 
+                2, 
+                self.batch_size if self.batch_size is not None else 0,
+                seqlen,
+                self.n_heads,
+                self.d_head
+            ))
 
-        return self.cache[layer_idx, 0, :, :, :self.cur_pos + 1, :], self.cache[layer_idx, 1, :, :, :self.cur_pos + 1, :]
-    
+        assert self.batch_size == bs, f"Input batch size does not match cache's batch size. Got input: {bs} and cache {self.batch_size}."
+
+        if seqlen + self.cur_pos > self.shape[-3]:
+            self.cache = torch.cat([self.cache, 
+                                    torch.zeros(self.n_layers, 2, self.batch_size, seqlen, self.n_heads, self.d_head, 
+                                                            # device=device, dtype=dtype
+                                )], 
+                                   dim=-3)
+
+        self.cache.to(device=device, dtype=dtype)
+
+
     def advance(self):
-        self.cur_pos += 1
+        if self.cur_pos == 0:
+            self.cur_pos = self.cache.shape[-3]
+        else:
+            self.cur_pos += 1
     
-    @torch.no_grad()
-    def keys(self) -> torch.Tensor:
-        assert self.cache is not None, "KV cache is empty. Cannot retrieve keys."
-        return self.cache[:, 0, :, :, :self.cur_pos, :]  # n_layers x B x n_heads x seq_len x d_head
-    
-    @torch.no_grad()
-    def values(self) -> torch.Tensor:
-        assert self.cache is not None, "KV cache is empty. Cannot retrieve values."
-        return self.cache[:, 1, :, :, :self.cur_pos, :]  # n_layers x B x n_heads x seq_len x d_head
-    
-    @torch.no_grad()
-    def get_kv(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        assert layer_idx < self.shape[0], f"Layer index out of bounds: {layer_idx} >= {self.shape[0]}"
-        k = self.cache[layer_idx, 0, :, :, :self.cur_pos, :]  # B x n_heads x seq_len x d_head
-        v = self.cache[layer_idx, 1, :, :, :self.cur_pos, :]  # B x n_heads x seq_len x d_head
-        return k, v
-    
+    def _init_from_ddp_cache(self, ddp_cache_data: Iterable[tuple[torch.Tensor, torch.Tensor]]):
+        pass # TODO
+
     @torch.no_grad()
     def drop_row(self, row_idx: int) -> None:
         """

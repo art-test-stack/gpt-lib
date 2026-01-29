@@ -74,8 +74,8 @@ def is_flash_attn3_available_from_kernel() -> bool:
     if not is_torch_available():
         return False
     try: 
-        from kernels import get_kernels
-        flash_attn3 = get_kernels('varunneal/flash-attention-3').flash_attn_interface
+        from kernels import get_kernel
+        flash_attn3 = get_kernel('varunneal/flash-attention-3').flash_attn_interface
         return True
     except:
         return False

@@ -1,7 +1,9 @@
+from gpt_lib.utils.import_utils import is_flash_attn3_available_from_kernel
+
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
-from typing import Any, List, Literal, get_args
+from typing import Any, List, Literal, Optional, get_args
 from pathlib import Path
 import json
 import pickle
@@ -50,18 +52,6 @@ from gpt_lib.utils.types import (
 )
 from gpt_lib.utils.special_tokens import SpecialTokens
 
-# DEVICES = Literal["cpu", "cuda", "mps"]
-# TOKENIZER_SOURCES = Literal["tiktoken", "bytelevelbpe", "rustbpe", "huggingface", "dummy"]
-# TOKENIZER_TENSORS = Literal["pt", "np", "tf", "jax"]
-# NORMALIZATION_TYPES = Literal["rms", "layer"]
-# ATTN_IMPL_TYPES = Literal["sdpa", "flash_attention", "impl"]
-# POSITIONAL_ENCODING_TYPES = Literal["positional", "rope"]
-# TF_TYPES = Literal["dense", "moe"]
-# DTYPES = Literal["float32", "float16", "bfloat16"]
-# OPTIMIZERS = Literal["adamw", "sgd", "adam", "muon"]
-# LOSS_TYPES = Literal["cross_entropy", "kl_divergence"]
-# LOSS_REDUCTION_TYPES = Literal["none", "mean", "sum"]
-# TP_MODES = Literal["row", "column"]
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -87,9 +77,9 @@ class ParallelismConfig(BaseModel):
     # dp_group: dist.ProcessGroup | None = None
     # tp_group: dist.ProcessGroup | None = None
 
-    n_heads_q: int | None = None
-    n_heads_kv: int | None = None
-    d_head_q: int | None = None
+    n_heads_q: Optional[int] = None
+    n_heads_kv: Optional[int] = None
+    d_head_q: Optional[int] = None
 
     tp_mode: TpModes = "row"
 
@@ -108,10 +98,10 @@ class ParallelismConfig(BaseModel):
 class TokenizerConfig(BaseModel):
     name: str = "ic1_tok"
     dirname: Path = MODELS_FOLDER
-    vocab_size: int | None = VOCAB_SIZE
-    max_context: int | None = MAX_CONTEXT
-    pat_str: str | None = PAT_STR_GPT2
-    special_tokens: SpecialTokens | None = Field(default_factory=SpecialTokens)
+    vocab_size: int = VOCAB_SIZE
+    max_context: Optional[int] = MAX_CONTEXT
+    pat_str: Optional[str] = PAT_STR_GPT2
+    special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
     def model_post_init(self, context: Any) -> None:
@@ -136,8 +126,7 @@ class TrainingTokenizerConfig(TokenizerConfig):
     merges_per_pass: int = 512
 
 class TransformerConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+    # model_config = ConfigDict(frozen=True)
     tf_type: TfTypes = "dense"
 
     vocab_size: int = VOCAB_SIZE
@@ -155,25 +144,32 @@ class TransformerConfig(BaseModel):
     d_model: int = DIM_MODEL
     d_ffn: int = DIM_FFN  # 4 * dim_model
     n_heads: int = NUM_HEADS
-    n_kv_heads: int = NUM_HEADS  # GQA
+    n_kv_heads: Optional[int] = None # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
+    tie_word_embeddings: bool = True # TODO: implement it in model
 
     dropout: float = DROPOUT
+    attention_dropout: Optional[float] = None
+
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
     norm_eps: float = 1e-8
-    hidden_act: str = "gelu" # TODO: make it compatible with model.Transformer implementation
+    act_func: str = "gelu" # TODO: make it compatible with model.Transformer implementation
 
+    # TODO: padged attention implementation
     attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
+    # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     enable_gqa: bool = False
 
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     # Based on: https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py
-    window_pattern: str = "SSSL" 
-    window_size: int = 256  # Size of short window
+    window_pattern: str = "SSSL" # Can only be composed of 'L' and 'S' characters
+    window_size: Optional[int] = None  # Size of short windows
+    max_window_size: Optional[int] = None  # Maximum size of short windows (for dynamic window sizing)
+    _window_sizes: List[tuple[int, int]] = PrivateAttr(default_factory=list) # TODO later: make it dynamic
 
     softcap: float = 18.0
     
@@ -182,17 +178,47 @@ class TransformerConfig(BaseModel):
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.d_head != self.d_model // self.n_heads:
             warnings.warn(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). This may lead to unexpected behavior in attention mechanisms.")
+        
+        self.n_kv_heads = getattr(self, "n_kv_heads", None) or self.n_heads
+        self.attention_dropout = self.attention_dropout if self.attention_dropout is not None else self.dropout
+
         if not self.norm_before_attn:
             warnings.warn("Using post-attention normalization (norm_before_attn=False) may lead to training instability.")
-        if self.attn_impl == "flash_attention":
-            try:
-                import flash_attn
-            except ImportError:
-                warnings.warn("FlashAttention is not installed. Falling back to standard attention.")
-                self.attn_impl = "sdpa"
-        if self.attn_impl == "impl":
-            warnings.warn("Using 'impl' attention type is not recommended for production use. Only use for experimentation or retrieve attention weights.")
+        
+        # TODO: handles warnings fallbacks
+        # if self.attn_impl == "flash_attention":
+        #     if not is_flash_attn3_available_from_kernel():
+        #         warnings.warn("FlashAttention 3 kernel is not available. Falling back to standard attention.")
+        #         self.attn_impl = "sdpa"
+        #     # try:
+        #     #     import flash_attn
+        #     # except ImportError:
+        #     #     warnings.warn("FlashAttention is not installed. Falling back to standard attention.")
+        #     #     self.attn_impl = "sdpa"
+        # if self.attn_impl == "impl":
+        #     warnings.warn("Using 'impl' attention type is not recommended for production use. Only use for experimentation or retrieve attention weights.")
 
+        self._window_sizes = self._compute_window()
+        # freeze model_config manually to prevent issues with nested models
+        self.model_config["frozen"] = True
+        
+
+    def _compute_window(self) -> str:
+        pattern = self.window_pattern.upper()
+        assert all(c in {'L', 'S'} for c in pattern), "Invalid characters in window_pattern. Only 'L' and 'S' are allowed."
+
+        short_window_size = self.window_size or (self.max_context // 2)
+        window_table = {
+            'L': (-1, 0), # or (self.max_context, 0) works
+            'S': (short_window_size, 0)
+        }
+        window_sizes = []
+        for idx in range(self.n_layers - 1):
+            char = pattern[idx % len(pattern)]
+            window_sizes.append(window_table[char])
+        window_sizes.append((-1, 0))  # Final layer always long
+        return window_sizes
+    
 class DenseTransformerConfig(TransformerConfig):
     pass
 
@@ -201,8 +227,8 @@ class MoETransformerConfig(TransformerConfig):
     nb_experts: int = 16
     expert_capacity_factor: float = 1.0
 
-class ObjectiveConfig(BaseModel):
-    objective_fn: LossTypes = "cross_entropy"
+class LossConfig(BaseModel):
+    loss_fn: LossTypes = "cross_entropy"
     kwargs: dict = Field(default_factory=dict)
     ignore_index: int = -100
     reduction: LossReductionTypes = "none"
@@ -215,8 +241,21 @@ class GenerationConfig(BaseModel):
     repetition_penalty: float = 1.0
     do_sample: bool = True
     num_return_sequences: int = 1
+    seed: Optional[int] = None
     stream: bool = False
     use_cache: bool = True
+
+    def model_post_init(self, context: Any) -> None:
+        if self.max_length <= 0:
+            raise ValueError("max_length must be a positive integer.")
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be a positive float.")
+        if not (0.0 <= self.top_p <= 1.0):
+            raise ValueError("top_p must be in the range [0.0, 1.0].")
+        if self.num_return_sequences <= 0:
+            raise ValueError("num_return_sequences must be a positive integer.")
+        if self.seed is None or self.seed < 0:
+            self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
 class OptimizerSpec(BaseModel):
     name: OptimizerNames = "adamw"
@@ -311,22 +350,23 @@ class GPTConfig(BaseModel):
         tokenizer (TokenizerConfig): Configuration for the tokenizer.
         dir (str | Path): Directory to save/load the model.
         model (TransformerConfig): Configuration for the transformer model.
-        objective (ObjectiveConfig): Configuration for the training objective.
+        loss (LossConfig): Configuration for the training loss.
 
     ## Methods:
         to_file(mode="json" | "pickle"): Save the configuration to a file in the specified format.
         from_file(model_name: str, model_dir: str | Path): Load the
     """
     model_config = ConfigDict(
-        json_encoders={Path: str}
+        json_encoders={Path: str},
+        # frozen=True
     )
-    name: str = "ic1"
+    name: str = "ic1" # TODO: change it to something more general like 'base_model' -> generate different config to different state model (pretrained, finetuned, etc.)
     tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     dirname: str | Path = MODELS_FOLDER
     model: TransformerConfig = Field(default_factory=TransformerConfig)
-    objective: ObjectiveConfig = Field(default_factory=ObjectiveConfig)
+    loss: LossConfig = Field(default_factory=LossConfig)
     trainer: TrainingConfig = Field(default_factory=TrainingConfig)
-    dtype: Dtypes = "float32"
+    dtype: Dtypes = "bfloat16"
     device: Devices = DEVICE
 
     def model_post_init(self, context: Any) -> None:
@@ -409,14 +449,14 @@ class TransformerOutput(BaseModel):
     logits: torch.Tensor
     attentions: List[torch.Tensor] | None = None
     hidden_states: List[torch.Tensor] | None = None
-    kv_cache: dict | None = None
+    past_key_values: Any | dict | None = None
 
 class ModelOutput(TransformerOutput):
-    loss: torch.Tensor | None = None
-    log_probs: torch.Tensor | None = None
+    loss: Optional[torch.Tensor] = None
+    log_probs: Optional[torch.Tensor] = None
 
 class ModelCompletionOutput(ModelOutput):
-    completions: List[str] | None = None
+    completions: Optional[List[str]] = None
     done: bool = False
 
 class TrainingState(BaseModel):

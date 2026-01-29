@@ -16,7 +16,35 @@ from typing import Callable, Iterable
 from pathlib import Path
 
 
-class Trainer:
+class BaseTrainer:
+    def __init__(
+            self,
+            model: GPTModel,
+            train_dataset: Iterable,
+            val_dataset: Iterable,
+            test_dataset: Iterable,
+            config: TrainingConfig | None = None,
+            device: torch.device = DEVICE,
+            dtype: torch.dtype = torch.float32,
+        ):
+        pass
+
+    def fit(self):
+        raise NotImplementedError
+    
+    def save_model(self, path: Path) -> None:
+        raise NotImplementedError
+    
+    def load_model(self, path: Path) -> None:
+        raise NotImplementedError
+    
+    def save_metrics(self) -> None:
+        raise NotImplementedError
+    
+    def load_metrics(self, path: Path) -> None:
+        raise NotImplementedError
+
+class Trainer(BaseTrainer):
     def __init__(
             self, 
             model: GPTModel, # tokenizer should be integrated in the model
@@ -28,7 +56,7 @@ class Trainer:
             dtype: torch.dtype = torch.float32,
             optimizer: torch.optim.Optimizer | None = None, # optional optimizer builder
         ):
-        super().__init__()
+        super().__init__(model=model, train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset)
 
         self.config: TrainingConfig = config if config is not None else model.config.trainer 
         self.model = model.to(device=device, dtype=dtype)

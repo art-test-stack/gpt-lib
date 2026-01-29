@@ -2,13 +2,16 @@ from gpt_lib.model.layers import (
     DecoderLayer, 
     Linear, 
     Module, 
-    apply_layer_norm,
-    apply_rms_norm,
+    # apply_layer_norm,
+    # apply_rms_norm,
+    build_norm,
+)
+from gpt_lib.model.loss import build_loss
+from gpt_lib.model.utils import (
+    KVCache, SelfAttentionMask,
     precompute_rope, 
     precompute_positional_encoding
 )
-from gpt_lib.model.loss import build_objective
-from gpt_lib.model.utils import KVCache, SelfAttentionMask
 from gpt_lib.tokenizer.tokenizer import build_tokenizer
 from gpt_lib.utils.schemas import (
     get_default_device,
@@ -23,7 +26,7 @@ from gpt_lib.utils.schemas import (
 from gpt_lib.utils.types import Dtypes, Devices, TokenizerTensors
 from gpt_lib.utils.default import MODELS_FOLDER, DEVICE
 
-from typing import List, Iterator
+from typing import Any, List, Iterator, Optional
 
 import torch
 import torch.nn as nn
@@ -33,6 +36,39 @@ from pathlib import Path
 
 import warnings
 
+def init_weights(model: nn.Module) -> nn.Module:
+    # Dummy; TODO: Make more flexible weight initialization
+    try:
+        for name, layer in model.layers.items():
+            if hasattr(layer, "init_weights"):
+                layer.init_weights()
+            else:
+                for p in layer.parameters():
+                    if p.dim() > 1:
+                        nn.init.uniform_(p)
+    except:
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p) 
+    return model
+
+def build_model_from_config(
+        config: GPTConfig,
+    ) -> "GPTModel":
+    with torch.device("meta"):
+        model = Transformer(config=config.model, device=config.device, dtype=config.dtype)
+    model = init_weights(model)
+    # model.load_state_dict(
+    #     state_dict=torch.load(
+    # )
+    try:
+        pe_cache = model._precompute_pos_enc()
+        model.pe_cache = pe_cache
+    except Exception as e:
+        warnings.warn(f"Precomputation of positional encodings failed: {str(e)}", UserWarning)
+    
+    model.to_empty(device=config.device)
+    return model
 
 class Transformer(Module):
     def __init__(
@@ -42,31 +78,36 @@ class Transformer(Module):
             dtype: torch.dtype = torch.float32,
         ) -> None:
         super().__init__()
+        # init the model in meta device first
         if isinstance(device, str):
             device = torch.device(device)
         self.config = config
+        # self._model_as_meta = True # TODO: thinking about it to automatically handle meta init -> forward path
         self.vocab_size = config.vocab_size
         self.pad_token_id = config.pad_id
+        self.window_sizes = config._window_sizes
         # self.bos_token_id = config.bos_id
         # self.eos_token_id = config.eos_id
         self.device = device
         self.dtype = dtype
-        if self.config.positional_encoding == "rope":
-            rope_cache = precompute_rope(
-                seq_len=config.max_context,
-                d_head=config.d_head,
-                base=10_000,
-                dtype=dtype,
-                device=device,
-            )
-            self.register_buffer("pe_cache", rope_cache, persistent=False)
-        elif self.config.positional_encoding == "positional":
-            pos_enc = precompute_positional_encoding(config.max_context, config.d_model, dtype=dtype, device=device)
-            self.register_buffer("pe_cache", pos_enc, persistent=False)
-        elif self.config.positional_encoding == "alibi":
-            raise NotImplementedError("ALiBi positional encoding is not yet implemented.")
-        else:
-            raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
+        _pe_cache = self._precompute_pos_enc()
+        self.register_buffer("pe_cache", _pe_cache, persistent=False)
+        # if self.config.positional_encoding == "rope":
+        #     rope_cache = precompute_rope(
+        #         seq_len=config.max_context,
+        #         d_head=config.d_head,
+        #         base=self.config.rope_params.get("rope_theta", 10000),
+        #         dtype=dtype,
+        #         device=device,
+        #     )
+        #     self.register_buffer("pe_cache", rope_cache, persistent=False)
+        # elif self.config.positional_encoding == "positional":
+        #     pos_enc = precompute_positional_encoding(config.max_context, config.d_model, dtype=dtype, device=device)
+        #     self.register_buffer("pe_cache", pos_enc, persistent=False)
+        # elif self.config.positional_encoding == "alibi":
+        #     raise NotImplementedError("ALiBi positional encoding is not yet implemented.")
+        # else:
+        #     raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
 
         # TODO: Will change to customed embedding
         embedding = nn.Embedding(
@@ -97,8 +138,16 @@ class Transformer(Module):
                 for layer_idx in range(config.n_layers)
             ])
         ))
-        
+
+
         self.lm_head = Linear(config.d_model, config.vocab_size, bias=False)
+
+        if config.tie_word_embeddings:
+            # not sure if this works / maybe have to check dtype - at least
+            # self.lm_head.weight = self.layers.emb.weight.T # E -> V
+            # TODO: solve this naive solution
+            pass
+
         self.w_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers, dtype=dtype), requires_grad=True)
         self.w_res = torch.nn.Parameter(torch.zeros(self.config.n_layers, dtype=dtype), requires_grad=True)
 
@@ -108,59 +157,71 @@ class Transformer(Module):
         # padded_vocab_size = config.vocab_size
         # self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layers) if has_ve(i, config.n_layers)})
 
-        if self.config.normalization == "rms":
-            self.norm = apply_rms_norm
-        elif self.config.normalization == "layer":
-            self.norm = apply_layer_norm
-        else:
-            raise ValueError(f"Unknown normalization type: {self.config.normalization}")
-                
+        self.norm = build_norm(self.config.normalization, eps=self.config.norm_eps, torch_impl=True)
+    
     def forward(
             self, 
             input_ids: torch.Tensor,
             attn_mask: torch.Tensor | None = None,
-            kv_cache: dict | None = None,
+            past_key_values: Any = None,
             return_attentions: bool = False,
             return_hidden_states: bool = False,
         ):
-        assert (kv_cache is None) or (not self.training), "KV cache can not be used during training."
-        B, T = input_ids.size()
+        assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
+        # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
+        assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
 
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
-        assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
-        assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
+        B, T = input_ids.size()
 
+        T0 = 0
+        if past_key_values is not None:
+            if hasattr(past_key_values, "cur_pos"):
+                T0 = past_key_values.cur_pos
+            elif hasattr(past_key_values, "current_length"):
+                T0 = past_key_values.current_length
+            elif hasattr(past_key_values, "shape"):
+                T0 = past_key_values.shape[3] # assuming shape is (L, 2, B, T, H, D)
+            else:
+                pass
+        
         x = self.layers.emb(input_ids)
+
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
 
+        if self.config.positional_encoding == "rope":
+            rope_cache = self.pe_cache[T0:T0+T]
+        else:
+            rope_cache = None
+
         x = self.norm(x)
-        x0 = x.clone()
+        x0 = x # .clone()
         attentions = []
+        hidden_states = [("emb", x)] if return_hidden_states else None
+        assert not torch.isnan(x).any(), "..."
         for i, layer in enumerate(self.layers.blocks, 0):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.layers.blocks) - 1) and False
             x = self.w_res[i] * x + self.w_x0[i] * x0
             x, attn = layer(x, attn_mask=attn_mask,
                 # TODO: not yet supported
-                kv_cache=kv_cache, 
+                kv_cache=past_key_values, 
+                return_attn_weights=return_attn,
                 # TODO: return_attn in special cases only -> interpretability
                 # return_attentions=return_attn 
             )
-            assert x.nansum() != 0, f"NaN detected in layer {i} output."
             if return_attn:
                 attentions.append(attn)
+            if return_hidden_states:
+                hidden_states.append((f"layer_{i}", x))
 
-        if kv_cache is not None:
-            kv_cache.advance()
-
+        # if kv_cache is not None:
+        #     kv_cache.advance()
         x = self.norm(x)
-
-        if return_hidden_states:
-            hidden_states = x
 
         softcap = self.config.softcap
         logits = self.lm_head(x)
@@ -173,7 +234,7 @@ class Transformer(Module):
             logits=logits,
             attentions=attn if return_attentions else None,
             hidden_states=hidden_states if return_hidden_states else None,
-            kv_cache=kv_cache
+            past_key_values=past_key_values
         )
 
     def resize_token_embeddings(self, new_size: int) -> None:
@@ -188,6 +249,24 @@ class Transformer(Module):
         )
         self.vocab_size = new_size
         self.lm_head = Linear(self.config.d_model, new_size, bias=False)
+
+    def _precompute_pos_enc(self, new_max_context: Optional[int] = None) -> None:
+        if not new_max_context:
+            new_max_context = self.config.max_context
+        if self.config.positional_encoding == "rope":
+            pe_cache = precompute_rope(
+                seq_len=new_max_context,
+                d_head=self.config.d_head,
+                base=self.config.rope_params.get("rope_theta", 10000),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        elif self.config.positional_encoding == "positional":
+            pe_cache = precompute_positional_encoding(new_max_context, self.config.d_model, dtype=self.dtype, device=self.device)
+        else:
+            raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
+
+        return pe_cache
     
 
 class GPTModel:
@@ -202,8 +281,21 @@ class GPTModel:
         self.tokenizer = tokenizer
         # TODO: Add support for loading Dense vs MoE vs Hybrid models
         self.model = model
-        self.loss_fn = build_objective(config.objective)
-        self.model = self.model.to(DEVICE)
+        self.loss_fn = build_loss(config.loss)
+        # self.model = self.model.to(DEVICE)
+
+        # def compute_grad_norm(module, grad_input, grad_output):
+        #     total_norm = 0.0
+        #     for g in grad_input:
+        #         if g is not None:
+        #             param_norm = g.data.norm(2)
+        #             total_norm += param_norm.item() ** 2
+        #     total_norm = total_norm ** (1. / 2)
+        #     # You can log or print the total_norm here if needed
+        #     # print(f"Gradient norm: {total_norm}")
+            
+            
+        # self.model.register_full_backward_hook(compute_grad_norm)
 
         self.attn_mask = SelfAttentionMask(pad_idx=config.model.pad_id, max_context=config.model.max_context)
 
@@ -211,20 +303,24 @@ class GPTModel:
         assert all(hasattr(self.model, attr) for attr in ["config", "pad_token_id", "vocab_size"]), "Model must have config, pad_token_id and vocab_size attributes"
         assert self.model.pad_token_id == self.tokenizer.pad_token_id, "Tokenizer pad token id must match model pad id"
         assert self.model.vocab_size == self.tokenizer.vocab_size, "Model vocab size must match tokenizer vocab size"
-        assert self.model.pad_token_id == self.config.objective.ignore_index, "Objective ignore index must match model pad id"
+        # assert self.model.pad_token_id == self.config.loss.ignore_index, "Loss ignore index must match model pad id"
 
         self.vocab_size = self.config.model.vocab_size
         self.pad_token_id = self.config.model.pad_id
         self.bos_token_id = self.config.model.bos_id
         self.eos_token_id = self.config.model.eos_id
     
+    @property
+    def device(self) -> torch.device:
+        return next(self.model.parameters()).device
+    
     def __call__(self, input_ids, labels=None, *args, **kwargs) -> ModelOutput:
-        input_ids = input_ids.to(self.config.device)
+        input_ids = input_ids.to(self.device)
         attn_mask = self.attn_mask(input_ids)
         logits = self.model(input_ids, attn_mask=attn_mask, *args, **kwargs).logits
         loss = None
         if labels is not None:
-            labels = labels.to(self.config.device)
+            labels = labels.to(self.device)
             loss = self.loss_fn(logits, labels)
         return ModelOutput(logits=logits, loss=loss)
 
@@ -237,10 +333,17 @@ class GPTModel:
     def train(self) -> None:
         self.model.train()
 
-    def to(self, *args, **kwargs) -> None:
-        self.model = self.model.to(*args, **kwargs)
-        self.config.device = self.model.device
-        self.config.dtype = self.model.dtype
+    def to(self, 
+            # device: DeviceLikeType | None = ...,
+            # dtype: dtype | None = ...,
+            # non_blocking: bool = ...
+            device = ...,
+            dtype = ...,
+            non_blocking = ...
+        ) -> None:
+        self.model = self.model.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        # self.config.device = self.model.device
+        # self.config.dtype = self.model.dtype
 
     def estimate_flops(self) -> float:
         """Estimate FLOPs per token based on model configuration.
@@ -249,8 +352,9 @@ class GPTModel:
         """
         nparams = self.number_of_parameters()
         nparams_emb = self.model.emb.weight.numel()
-
         l, h, q, t = self.config.model.n_layers, self.config.model.n_heads, self.config.model.d_model // self.config.model.n_heads, self.config.model.max_context
+        
+        # TODO: consider other components if needed (lm_head, norm, window_size, etc.)
         flops_per_token = 6 * (nparams - nparams_emb) + 12 * l * h * q * t
         return flops_per_token
     
@@ -277,23 +381,24 @@ class GPTModel:
     def forward(
             self, 
             input_ids: torch.Tensor,
-            labels: torch.Tensor | None = None,
+            labels: Optional[torch.Tensor] = None,
             attentions: bool = False,
-            kv_cache: dict | None = None,
+            past_key_values: dict | None = None,
             log_prob: bool = False,
             temperature: float = 1.0,
             **kwargs
         ) -> ModelOutput:
-        assert (kv_cache is None) or (not self.model.training), "KV cache can not be used during training."
+        assert (past_key_values is None) or (not self.model.training), "KV cache can not be used during training."
 
         input_ids = input_ids.to(self.config.device)
         labels = labels.to(self.config.device) if labels is not None else None
-        attn_mask = self.attn_mask(input_ids)
+        # TODO: ignore attn mask (only used for padding -> ignore padding mask for now)
+        # attn_mask = self.attn_mask(input_ids)
         output: TransformerOutput = self.model(
             input_ids, 
             return_attentions=attentions, 
-            attn_mask=attn_mask,
-            kv_cache=kv_cache
+            # attn_mask=attn_mask,
+            past_key_values=past_key_values
         )
         if temperature > 0:
             logits = output.logits / temperature
@@ -308,56 +413,98 @@ class GPTModel:
             log_probs=F.log_softmax(logits, dim=-1) if log_prob else None,
             probs=F.softmax(logits, dim=-1) if log_prob else None,
             hidden_states=output.hidden_states,
-            kv_cache=kv_cache,
+            past_key_values=past_key_values,
         )
         
         if labels is not None:
             assert output.logits.device == labels.device, f"Logits and labels must be on the same device. Got {output.logits.device} and {labels.device}"
-            loss = self.loss_fn(output, labels)
-            output.loss = loss
+            output.loss = self.loss_fn(output, labels)
 
         return output
     
     @torch.inference_mode()
     def generate(
             self,
-            text: str | List[str],
-            ground_truth: str | List[str] | None = None,
+            input_ids: torch.Tensor,
+            ground_truth: Optional[torch.Tensor] = None,
+            # text: str | List[str],
+            # ground_truth: str | List[str] | None = None,
             generation_config: GenerationConfig | None = None,
             assistant_model = None, # TODO: implement assistant model functionality
         ) -> ModelCompletionOutput | Iterator[ModelCompletionOutput]:
         if assistant_model is not None:
             warnings.warn("Assistant model functionality is not yet implemented. Assistant model provided is just ignored.", UserWarning)
         if generation_config is None:
+            warnings.warn("No generation config provided. Using default generation config.", UserWarning)
             generation_config = GenerationConfig()
+        if not generation_config.use_cache:
+            warnings.warn("GenerationConfig.use_cache is False. Generation may be slow as prefill will be done for each step.", UserWarning)
         if isinstance(generation_config, dict):
-            generation_config = GenerationConfig(**generation_config)
+            generation_config = GenerationConfig.model_validate(**generation_config)
 
         self.eval()
-        if isinstance(text, str):
-            text = [text]
-        input_ids = self.tokenizer.batch_encode(text, add_special_tokens=True)
-        input_ids = torch.tensor(input_ids, device=next(self.model.parameters()).device)
+        # if isinstance(text, str):
+        #     text = [text]
+
+        # input_ids = self.tokenizer.batch_encode(text, add_special_tokens=True, return_tensors="pt")
+        input_ids = input_ids.to(self.device)
 
         if ground_truth is not None:
-            if isinstance(ground_truth, str):
-                ground_truth = [ground_truth]
-            label_ids = self.tokenizer.encode(ground_truth, add_special_tokens=True)
-            label_ids = torch.tensor(label_ids, device=next(self.model.parameters()).device)
+            # if isinstance(ground_truth, str):
+            #     ground_truth = [ground_truth]
+            # label_ids = self.tokenizer.encode(ground_truth, add_special_tokens=True, return_tensors="pt")
+            label_ids = label_ids.to(self.device)
         else:
             label_ids = None
 
-        generated = input_ids
-
+        kv_cache = None
         if generation_config.use_cache:
-            kv_cache = KVCache(
-                batch_size=input_ids.size(0),
-                n_layerss=self.config.model.n_layerss,
-                n_heads=self.config.model.n_heads,
-                d_head=self.config.model.d_head,
-                max_seq_len=generation_config.max_length
-            )
-        pass 
+            kv_cache = KVCache(config=self.config.model)
+            # kv_cache = kv_cache.maybe_init()
+
+
+        # Prefill: first forward pass with the full input_ids
+        # greedy for now; TODO: implement sampling methods following self.forward method
+        logits = self.model(
+            input_ids=input_ids,
+            past_key_values=kv_cache,
+            return_attentions=False,
+        ).logits[:,-1,:]
+        # TODO: init gpt_lib.model.utils.RowState for generation
+        num_generated = 0
+        max_length = generation_config.max_length
+        batch_size = input_ids.size(0)
+        # TODO: dummy implementation for results
+        # Initialize with the last token from the first pass
+        results = torch.empty((batch_size, 0), dtype=torch.long, device=self.device)
+        while True:
+            
+            # TODO: add row state for stop conditions/more efficient generation
+            
+            # TODO: implement sampling methods
+            generated_ids = torch.argmax(logits, dim=-1).unsqueeze(-1)
+            results = torch.cat([results, generated_ids], dim=-1)
+            num_generated += 1
+            # results.append(generated_ids.squeeze().tolist())
+
+            if max_length is not None and num_generated >= max_length:
+                break
+            # results.append(self.tokenizer.decode_batch(generated_ids.squeeze().tolist()))
+
+            # TODO: add forced tokens support
+
+            if kv_cache is not None:
+                input_ids = generated_ids
+            else:
+                input_ids = torch.cat([input_ids, generated_ids], dim=-1)
+
+            logits = self.model(
+                input_ids=input_ids,
+                past_key_values=kv_cache,
+                return_attentions=False,
+            ).logits[:,-1,:]
+        
+        return results.tolist()
 
     # TODO
     def generate_batch(self):
@@ -418,7 +565,7 @@ class GPTModel:
             checkpoint_version="latest",
             model_dir=model_dir
         )
-    
+
     @classmethod
     def load(
             cls,
@@ -432,7 +579,9 @@ class GPTModel:
         if not ckpt_version.endswith(".pth"):
             ckpt_version += ".pth"
         config = GPTConfig.from_file(model_name=model_name, model_dir=model_dir)
-        model = Transformer(config=config.model, device=config.device, dtype=config.dtype)
+
+        model = build_model_from_config(config)
+
         tokenizer = build_tokenizer(config.tokenizer)
         model_path = config.dirname / ckpt_version
         if not device:
@@ -446,10 +595,10 @@ class GPTModel:
     @classmethod
     def from_scratch(
             cls,
-            config: GPTConfig = GPTConfig()
+            config: GPTConfig
         ) -> "GPTModel":
         config.to_file(mode="pickle")
-        model = Transformer(config=config.model, device=config.device, dtype=config.dtype)
+        model = build_model_from_config(config)
         tokenizer = build_tokenizer(config.tokenizer)
         gpt = cls(model=model, tokenizer=tokenizer, config=config)
         gpt.init_weights()
@@ -461,7 +610,7 @@ class GPTModel:
             yaml_path: str | Path,
         ) -> "GPTModel":
         config = GPTConfig.from_yaml(yaml_path)
-        model = Transformer(config=config.model, device=config.device, dtype=config.dtype)
+        model = build_model_from_config(config)
         tokenizer = build_tokenizer(config.tokenizer)
         gpt = cls(model=model, tokenizer=tokenizer, config=config)
         gpt.init_weights()
@@ -473,18 +622,25 @@ class GPTModel:
             model_name: str,
         ) -> "GPTModel":
         # TODO: Implement conversion from Huggingface models for compatibility
-        raise NotImplementedError("from_huggingface is not yet supported.")
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        # config = GPTConfig.from_huggingface(model_name)
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name).to(config.device)
-        hf_tokenizer = AutoTokenizer.from_pretrained(model_name).to(config.device)
-
+        from gpt_lib.model.wrapper import init_mistral_model
+        warnings.warn("Loading from Huggingface is experimental and may not work as expected. Only works with Mistral model for now.", UserWarning)
+        model, tokenizer, config = init_mistral_model(model_name)
         gpt = cls(
-            model=hf_model,
-            tokenizer=hf_tokenizer,
-            config=GPTConfig()
+            model=model,
+            tokenizer=tokenizer,
+            config=config
         )
         return gpt
+        # config = GPTConfig.from_huggingface(model_name)
+        # hf_model = AutoModelForCausalLM.from_pretrained(model_name).to(config.device)
+        # hf_tokenizer = AutoTokenizer.from_pretrained(model_name).to(config.device)
+
+        # gpt = cls(
+        #     model=hf_model,
+        #     tokenizer=hf_tokenizer,
+        #     config=GPTConfig()
+        # )
+        # return gpt
     
     def save_checkpoint(
             self,

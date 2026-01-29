@@ -4,11 +4,11 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from gpt_lib.utils.schemas import ModelOutput, ObjectiveConfig 
+from gpt_lib.utils.schemas import ModelOutput, LossConfig 
 
 from cut_cross_entropy import linear_cross_entropy
 
-class Objective(ABC):
+class BaseLoss(ABC):
     @abstractmethod
     def __call__(
         self,
@@ -19,7 +19,7 @@ class Objective(ABC):
         ...
 
 
-class CrossEntropyObjective(Objective):
+class CrossEntropyLoss(BaseLoss):
     def __init__(self, ignore_index=-100, reduction="mean"):
         self.ignore_index = ignore_index
         self.reduction = reduction
@@ -35,7 +35,7 @@ class CrossEntropyObjective(Objective):
         )
         return loss
 
-class CutCrossEntropyObjective(Objective):
+class CutCrossEntropyLoss(BaseLoss):
     def __init__(self, ignore_index=-100, reduction="mean"):
         self.ignore_index = ignore_index
         self.reduction = reduction
@@ -54,7 +54,7 @@ class CutCrossEntropyObjective(Objective):
         return loss
 
 
-class KLDivObjective(Objective):
+class KLDivLoss(BaseLoss):
     def __init__(self, epsilon: float = 0.1, ignore_index: int = -100):
         self.epsilon = epsilon
         self.ignore_index = ignore_index
@@ -81,16 +81,16 @@ class KLDivObjective(Objective):
         return kl
 
 
-def build_objective(config: ObjectiveConfig) -> "Objective":
-    loss_type = config.objective_fn
+def build_loss(config: LossConfig) -> "BaseLoss":
+    loss_type = config.loss_fn
     loss_kwargs = config.kwargs
     if loss_type == "cross_entropy":
-        return CrossEntropyObjective(
+        return CrossEntropyLoss(
             ignore_index=loss_kwargs.get("ignore_index", -100),
             reduction=loss_kwargs.get("reduction", "mean"),
         )
     elif loss_type == "kl_divergence":
-        return KLDivObjective(
+        return KLDivLoss(
             epsilon=loss_kwargs.get("epsilon", 0.1),
             ignore_index=loss_kwargs.get("ignore_index", -100),
         )

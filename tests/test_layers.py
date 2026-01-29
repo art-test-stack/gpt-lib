@@ -1,11 +1,13 @@
 import pytest
 from gpt_lib.model.layers import (
-    apply_rope,
-    precompute_rope, 
     apply_rms_norm,
     scaled_dot_product_attention,
 )
-from gpt_lib.model.utils import SelfAttentionMask
+from gpt_lib.model.utils import (
+    SelfAttentionMask,
+    apply_rope,
+    precompute_rope, 
+)
 from gpt_lib.utils.schemas import GPTConfig
 import torch
 import torch.nn.functional as F
