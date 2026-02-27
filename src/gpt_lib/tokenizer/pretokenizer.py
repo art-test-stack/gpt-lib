@@ -22,16 +22,17 @@ class SimplePreTokenizer:
     def _split(
             self, 
             text: str, 
-            drop_special_tokens: bool = False, 
-            byte_level: bool = False
+            drop_special_tokens: bool = False
         ) -> List[str]:
         if text == "":
             return []
 
         special_tokens = self.special_tokens
-        safe_tokens = [re.escape(t) for t in special_tokens]
-
-        reg = f"({'|'.join(safe_tokens)}|{self.split_pattern})"
+        if len(special_tokens) > 0:
+            safe_tokens = [re.escape(t) for t in special_tokens]
+            reg = f"({'|'.join(safe_tokens)}|{self.split_pattern})"
+        else: 
+            reg = self.split_pattern
 
         parts = re.findall(reg, text, flags=re.UNICODE)
         parts: List[str] = [p for p in parts if p != ""]

@@ -3,91 +3,85 @@ import random, pickle
 from gpt_lib.utils.default import RANDOM_SEED, CACHE_DIR
 from gpt_lib.data.loader import load_datasets
 from gpt_lib.data.normalizers import clean_codeparrot_example
+from typing import Union, Dict, Callable, Optional
 
 from tqdm import tqdm
 
-class Corpus:
+class TokenizerCorpus:
     def __init__(
             self, 
-            name: str,
             total_chars: int, 
             total_docs: int,
+            corpus_dir: Union[str, Path],
             random_seed: int = RANDOM_SEED,
-            sources: dict = {},
+            sources: Optional[dict] = None,
         ):
-        self.name = name
+        if isinstance(corpus_dir, str):
+            corpus_dir = Path(corpus_dir)
+        if not corpus_dir.suffix == ".txt":
+            corpus_dir = corpus_dir.with_suffix(".txt")
+        self.corpus_dir = corpus_dir
         self.random_seed = random_seed
         self.total_chars = total_chars
         self.total_docs = total_docs
         self.sources = sources 
-        self.out_path = CACHE_DIR / f"{self.name}_corpus.txt"
     
-    def save(self, out_path: Path = None):
-        path = out_path or (CACHE_DIR / f"{self.name}_corpus_meta.pkl")
-        with open(path, "wb") as f:
+    @property
+    def meta_path(self):
+        return self.corpus_dir.with_suffix(".meta.pkl")
+    
+    def save(self):
+        with open(self.meta_path, "wb") as f:
             pickle.dump(self, f)
 
-    def to_csv(self, out_path: Path = None):
-        path = out_path or (CACHE_DIR / f"{self.name}_corpus_meta.csv")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("name,random_seed,total_chars,total_docs,sources\n")
-            f.write(f"{self.name},{self.random_seed},{self.total_chars},{self.total_docs},\"{self.sources}\"\n")
+    def iterator(self, max_chars: Optional[int] = None):
+        nb_chars = 0
+        with open(self.corpus_dir, "r", errors="ignore") as f:
+            for line in f:
+                yield line.strip()
+                nb_chars += len(line)
+                if max_chars is not None and nb_chars >= max_chars:
+                    break
 
-    @staticmethod
-    def from_path(path: Path):
+    @classmethod
+    def from_path(cls, path: Union[Path, str]):
+        if not isinstance(path, Path):
+            path = Path(path)
+        if path.suffix == ".txt":
+            path = path.with_suffix(".meta.pkl")
         if not path.exists():
             raise FileNotFoundError(f"No such file: {path}")
         with open(path, "rb") as f:
             return pickle.load(f)
 
-    @staticmethod
-    def from_name(name: str):
-        path = CACHE_DIR / f"{name}_corpus_meta.pkl"
-        return Corpus.from_path(path)
-    
-    @staticmethod
+    @classmethod
     def write_from_sources(
-            name: str,
-            sources: dict,
+            cls,
+            corpus_dir: Union[str, Path],
+            sources: Optional[dict] = None, # dict ds_name: weight,
             chars_per_doc: int = 10_000,
             max_chars: int = 1_000_000_000,
+            random_seed: int = RANDOM_SEED,
         ):
-        out_path = CACHE_DIR / f"{name}_corpus.txt"
+        if isinstance(corpus_dir, str):
+            corpus_dir = Path(corpus_dir)
+        if not corpus_dir.suffix == ".txt":
+            corpus_dir = corpus_dir.with_suffix(".txt")
         char_count, doc_count = write_corpus_sample(
             sources=sources,
             chars_per_doc=chars_per_doc,
             max_chars=max_chars,
-            out_path=out_path,
+            out_path=corpus_dir,
+            random_seed=random_seed,
         )
-        meta = Corpus(
-            name=name,
+        meta = cls(
+            corpus_dir=corpus_dir,
             total_chars=char_count,
             total_docs=doc_count,
             sources=sources,
         )
         meta.save()
         return meta
-    
-
-def tokenizer_data_loader(config):
-    "Method based on local downloaded parquet files"
-    cache_dir = config.get("data_dir", CACHE_DIR )
-
-    if isinstance(config.get("tokenizer_name"), str):
-        cache_dir = Path(cache_dir)
-    
-    if not cache_dir.exists():
-        raise AssertionError
-    
-    ds_names = config.ds_names
-
-    for ds_name in ds_names:
-        ds_path = cache_dir / ds_name
-        if not ds_path.exists():
-            raise AssertionError(f"No such dataset directory: {ds_path}")
-        
-        for file in ds_path.iterdir():
-            yield file
 
 
 def write_corpus_sample(
@@ -96,24 +90,29 @@ def write_corpus_sample(
         max_chars=1_000_000_000,
         per_dataset_normalizer=None,
         out_path: Path = Path(".data/corpus.txt"),
-        split: str = "train"
+        split: str = "train",
+        show_progress: bool = True,
+        random_seed: int = RANDOM_SEED,
     ):
 
     if not sources:
         sources = [
-            { "path": "HuggingFaceFW/fineweb-edu", "weight": 0.6 },
-            { "path": "HuggingFaceTB/finemath", "weight": 0.25, "name": "finemath-4plus" },
+            { "path": "HuggingFaceFW/fineweb-edu", "weight": 0.7 },
+            { "path": "HuggingFaceTB/finemath", "weight": 0.15, "name": "finemath-4plus" },
             { "path": "codeparrot/codeparrot-clean", "weight": 0.15 },
         ]
     ds = load_datasets(sources, split=split)
     
-    r = random.Random(RANDOM_SEED)
-    
+    r = random.Random(random_seed)
+    if max_chars == -1:
+        max_chars = sum(len(text) for subset in ds.values() for text in subset["text"])
+        print(f"Calculated max_chars from datasets: {max_chars}")
     char_count = 0
     doc_count = 0
+    it = { name: iter(subset) for name, subset in ds.items() }
+
     with open(out_path, "w", encoding="utf-8") as fout:
-        it = { name: iter(subset) for name, subset in ds.items() }
-        with tqdm(total=max_chars, desc="Writing corpus") as pbar:
+        with tqdm(total=max_chars, desc="Writing corpus", disable=not show_progress) as pbar:
             while char_count < max_chars:
                 p = r.random()
                 try:
@@ -133,7 +132,7 @@ def write_corpus_sample(
                 if src.get("path") == "codeparrot/codeparrot-clean":
                     text = clean_codeparrot_example(text)
 
-                text = text[-chars_per_doc:]
+                text = text[-chars_per_doc:] # arbitrary truncation
                 if per_dataset_normalizer:
                     text = per_dataset_normalizer(text)
                 if not text.strip():
@@ -143,4 +142,3 @@ def write_corpus_sample(
                 char_count += len(text)
                 pbar.update(len(text))
     return char_count, doc_count
-    print("Wrote", char_count, "characters to", out_path)

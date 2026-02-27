@@ -13,13 +13,73 @@ from gpt_lib.utils.schemas import (
 )
 import tempfile
 
+# TODO: use fixtures for config and model initialization
+# @pytest.fixture(scope="module")
+# def model_config():
+#     model_name = "test-model"
+#     pad_token_id = 0
+#     tmpdirname = tempfile.mkdtemp()
+#     tokenizer_config = TokenizerConfig(
+#         vocab_size=1000,
+#         max_context=16,
+#         name="simple-tokenizer",
+#         source="dummy"
+#     )
+#     model_config = TransformerConfig(
+#         vocab_size=1000,
+#         pad_id=pad_token_id,
+#         max_context=16,
+#         d_model=16,
+#         d_ffn=64,
+#         n_heads=4,
+#         n_layers=4,
+#         d_head=4,
+#         dropout=0.1
+#     )
+#     loss_config = LossConfig(
+#         loss_fn="cross_entropy",
+#         ignore_index=pad_token_id,
+#         kwargs={"reduction": "mean"}
+#     )
+#     config = GPTConfig(
+#         name=model_name,
+#         tokenizer=tokenizer_config,
+#         model=model_config,
+#         loss=loss_config,
+#         dirname=tmpdirname
+#     )
+#     return config
+
+
+def assert_single_warning(fn, warning_type, message_substring=None):
+    """
+    Execute fn() and assert that exactly one warning of type `warning_type`
+    is emitted. Optionally check that its message contains `message_substring`.
+    """
+    with pytest.warns(warning_type) as record:
+        result = fn()
+
+    assert len(record) == 1, (
+        f"Expected exactly one {warning_type.__name__} "
+        f"but got {len(record)} warnings."
+    )
+    assert record[0].category is warning_type, (
+        f"Expected warning category {warning_type.__name__}, "
+        f"got {record[0].category} instead."
+    )
+    if message_substring is not None:
+        assert message_substring in str(record[0].message), (
+            f"Expected warning message to contain '{message_substring}', "
+            f"got '{record[0].message}'."
+        )
+    return result
+
 class TestGPTModel:
     model_name = "test-model"
     pad_token_id = 0
     tmpdirname = tempfile.mkdtemp()
     tokenizer_config = TokenizerConfig(
         vocab_size=1000,
-        max_context=16,
         name="simple-tokenizer",
         source="dummy"
     )
@@ -47,8 +107,6 @@ class TestGPTModel:
         dirname=tmpdirname
     )
 
-    # TESTS
-
     @pytest.mark.fast
     def test_model_loading_saving(self):
         self.config.to_file(mode="pickle")
@@ -60,27 +118,33 @@ class TestGPTModel:
             assert getattr(loaded_config, key) is not None, f"Key {key} is None in loaded config"
             assert getattr(loaded_config, key) == value, f"Value for key {key} does not match: {getattr(loaded_config, key)} != {value}"
         assert loaded_config == self.config, "Loaded config does not match the original"
-        model = GPTModel.from_scratch(config=self.config)
+        
+        model = assert_single_warning(
+            lambda: GPTModel.from_scratch(config=self.config),
+            UserWarning,
+            message_substring="DummyTokenizer",
+        )
         assert model.model.device != torch.device("meta"), "Model initialized on meta device"
 
         model.save_checkpoint(ckpt_version="test-1", keep_vars=True)
 
-        loaded_model = GPTModel.load(model_name=self.model_name, ckpt_version="test-1", model_dir=self.tmpdirname)
+        loaded_model = assert_single_warning(
+            lambda: GPTModel.load(model_name=self.model_name, ckpt_version="test-1", model_dir=self.tmpdirname),
+            UserWarning,
+            message_substring="DummyTokenizer",
+        )
         assert loaded_model.config == self.config, "Loaded model config does not match the original"
         assert loaded_model.model.state_dict().keys() == model.model.state_dict().keys(), "Loaded model state dict keys do not match the original"
         assert all(torch.equal(loaded_model.model.state_dict()[k], model.model.state_dict()[k]) for k in model.model.state_dict().keys()), "Loaded model state dict values do not match the original"
-
-
-    def init_model(self):
-        config = self.config
-        model = GPTModel.from_scratch(config)
-        return model
     
     @pytest.mark.fast
     def test_model_forward(self):
         config = self.config
-
-        model = GPTModel.from_scratch(config)
+        model = assert_single_warning(
+            lambda: GPTModel.from_scratch(config=self.config),
+            UserWarning,
+            message_substring="DummyTokenizer",
+        )
         model.eval()
         max_context = config.model.max_context
         vocab_size = config.model.vocab_size
@@ -119,8 +183,11 @@ class TestGPTModel:
     @pytest.mark.fast
     def test_model_generation(self):
         config = self.config
-
-        model = GPTModel.from_scratch(config)
+        model = assert_single_warning(
+            lambda: GPTModel.from_scratch(config=self.config),
+            UserWarning,
+            message_substring="DummyTokenizer",
+        )
         model.eval()
         max_context = config.model.max_context
         vocab_size = config.model.vocab_size
@@ -141,24 +208,27 @@ class TestGPTModel:
         )
 
         import time
-        t0 = time.time()
-        with torch.no_grad():
+        t1 = time.time()
+        with torch.no_grad(), pytest.warns(UserWarning) as record:
             results = model.generate(
                 input_ids=input_ids,
                 generation_config=generation_config
             )
-        t_no_cache = time.time() - t0
+        t_no_cache = time.time() - t1
+        assert len(record) == 1, f"Expected one warning when 'use_cache' is set to False in generation results. Got {len(record)} warnings instead."
+        assert record[0].category is UserWarning, f"Expected a warning when 'use_cache' is set to False in generation results. Got {record[0].category} instead."
+        assert "use_cache" in str(record[0].message)
 
         self._test_model_generation_results(results, batch_size)
         
         generation_config.use_cache = True
-        t0 = time.time()
+        t2 = time.time()
         with torch.no_grad():
             results_cache = model.generate(
                 input_ids=input_ids,
                 generation_config=generation_config
             )
-        t_with_cache = time.time() - t0
+        t_with_cache = time.time() - t2
 
         self._test_model_generation_results(results_cache, batch_size)
         assert t_with_cache < t_no_cache, f"Generation with cache is not faster than without cache. Got t with cache {t_with_cache} and t no cache {t_no_cache}"
@@ -167,9 +237,6 @@ class TestGPTModel:
         assert isinstance(results, list), "Generation results is not a list"
         assert batch_size == len(results), "Number of generated sequences does not match batch size"
         assert any(len(r) > 0 for r in results), "No generated sequences"
-        # for seq in results:
-            # assert isinstance(seq, int), "Generated sequence is not an integer token ID"
-            # assert len(seq) > 0, "Generated sequence is empty"
 
     @pytest.mark.fast
     def test_kv_cache_initialization(self):
@@ -183,7 +250,6 @@ class TestGPTModel:
         kv_state = KVCache(
             config=self.config.model,
         )
-        # B, T = 0 for initialization -> filled in with zeros later
         assert kv_state.shape == (L, 2, B, T, H, D), f"KV cache shape mismatch: {(L, 2, B, 1, H, D)}. Got {kv_state.shape}"
 
     @pytest.mark.fast
@@ -197,7 +263,6 @@ class TestGPTModel:
 
         We simulate prefill with a fake context -> check for kv_cache shape and value
         Then, we simulate decoding by adding one token at a time and checking the cache content.
-        TODO: 
             - we remove an element from the batch -> simulating beam search pruning
             - we increase the batch size -> simulating beam search expansion
             - we reset the cache -> simulating new sequence generation
@@ -247,12 +312,6 @@ class TestGPTModel:
             assert k_cache.shape == (B, T+dec_len, H, D), f"Key cache shape mismatch at layer {layer_idx}: {(B, T+dec_len, H, D)}. Got: {k_cache.shape}"
             assert v_cache.shape == (B, T+dec_len, H, D), f"Value cache shape mismatch at layer {layer_idx}: {(B, T+dec_len, H, D)}. Got: {v_cache.shape}"
             assert k_cache.shape == k_memory[layer_idx].shape, f"Key cache and Key memory do not match at layer {layer_idx}. Got {k_cache.shape} and {k_memory[layer_idx].shape}"
-            # for b in range(B):
-            #     for t in range(T+dec_len):
-            #          for h in range(H):
-            #              for d in range(D):
-            #                  assert k_cache[b,t,h,d] == k_memory[layer_idx][b,t,h,d], f"Got key cache value mismatch at layer {layer_idx}, batch {b}, time {t}, head {h}, dim {d}. Got {k_cache[b,t,h,d]} expected {k_memory[layer_idx][b,t,h,d]}"
-            #                  assert v_cache[b,t,h,d] == v_memory[layer_idx][b,t,h,d], f"Got value cache value mismatch at layer {layer_idx}, batch {b}, time {t}, head {h}, dim {d}."
             assert (k_cache == k_memory[layer_idx]).all(), f"Got key cache mismatching k memory at layer {layer_idx}."
             assert (v_cache == v_memory[layer_idx]).all(), f"Got value cache mismatching v memory at layer {layer_idx}."
 

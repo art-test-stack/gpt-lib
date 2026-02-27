@@ -2,7 +2,7 @@ from pathlib import Path
 from gpt_lib.utils.default import CACHE_DIR, RANDOM_SEED
 import argparse, random
 from gpt_lib.data.download import download_parquets
-from gpt_lib.data.config import DownloadConfig
+from gpt_lib.utils.schemas import DownloadConfig
 
 random.seed(RANDOM_SEED)
 

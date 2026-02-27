@@ -20,23 +20,49 @@ NUM_THREADS = os.cpu_count() # 16
 IS_TIKTOKEN = False # TODO: parse as arg
 
 SPECIAL_TOKENS = SpecialTokens()
-FORCED_TOKENS = []
 
 # CACHE_DIR = Path.home() / ".gpt_lib"
-CACHE_DIR = Path(".gpt_lib")
-DATA_FOLDER = CACHE_DIR / ".data"
+CACHE_DIR = Path(".gpt_lib") # easier for testing; can be overridden by env var or arg
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = CACHE_DIR / ".data"
 MIN_DOCUMENT_SIZE = 0
 OUTPUT_FOLDER = CACHE_DIR / ".output"
 MODELS_FOLDER = CACHE_DIR / ".models"
+TOKENIZERS_FOLDER = CACHE_DIR / ".tokenizers"
 VOCAB_SIZE = 32_000
-VOCAB_FILE = DATA_FOLDER / "vocab.json"
 MAX_TOKEN_LENGTH = 32
 
 # TOKEN_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+""" # GPT 4 SPLIT
+# https://arxiv.org/pdf/2402.01035
+_pat_str_eng_contr = dict(
+    gpt2=r"""'s|'t|'re|'ve|'m|'ll|'d""",
+    gpt4=r"""?i:[sdmt]|ll|ve|re""" # r""""?i:'s|'t|'re|'ve|'m|'ll|'d""" 
+)
+_pat_str_words = dict(
+    gpt2=r"""?\\p{L}+""",
+    gpt4=r"""[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+"""
+) 
+_pat_str_digits = dict(
+    gpt2=r"""?\\p{N}+""",
+    gpt4=r"""\\p{N}{1,3}"""
+)
+_pat_str_non_alpha = dict(
+    gpt2=r""" ?[^\\s\\p{L}\\p{N}]+""",
+    gpt4=r""" ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*"""
+)
+_pat_str_line_breaks = r"""\\s*[\\r\\n]+"""
+_pat_str_trailing_spaces = r"""\\s+(?!\\S)"""
+_pat_str_whitespace = r"""\\s+"""
 
-PAT_STR_GPT2 = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-PAT_STR_GPT4 = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
+# PAT_STR_GPT2 = r"""('s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PAT_STR_GPT2 = f"""{_pat_str_eng_contr['gpt2']}|{_pat_str_words['gpt2']}|{_pat_str_digits['gpt2']}|{_pat_str_non_alpha['gpt2']}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
+# PAT_STR_GPT4 = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+PAT_STR_GPT4 = f"""{_pat_str_eng_contr['gpt4']}|{_pat_str_words['gpt4']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
+# PAT_STR_punct = r"""(?\\p{L}+)|\\p{N}{1,3}|?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\s+(?!\S)|\s+"""
+PAT_STR_punct = f"""{_pat_str_words['gpt2']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}""" # pattern for pre-tokenization that focuses on punctuation, used for ablation
+# copied from tiktoken.get_encoding("cl100k_base")._pat_str and tiktoken.get_encoding("o200k_base")._pat_str
+PAT_STR_cl100k_base = r"""'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}++|\\p{N}{1,3}+| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*+|\\s++$|\\s*[\\r\\n]|\\s+(?!\\S)|\\s"""
+PAT_STR_o200k_base = r"""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"""
 # ------------- DRIVE -------------
 
 SAVE_ON_DRIVE = True
@@ -60,10 +86,6 @@ DIM_HEAD = DIM_MODEL // NUM_HEADS
 
 DROPOUT = .1
 
-MASK_VALUE = -1e9
-LINEAR_BIAS = False
-FLASH_ATTENTION = False # TODO: Not implemented
-
 # ------------- TRAIN -------------
 
 BATCH_SIZE = 128
@@ -85,24 +107,41 @@ VALIDATION_STEP = 50
 
 RANDOM_SEED = 42
 
-adamw_opt_params = {
-    "weight_decay": WEIGHT_DECAY,
-    "beta_1": BETA_1,
-    "beta_2": BETA_2,
-    "epsilon": EPSILON
-}
-muon_opt_params = {
-    "lr_min": MIN_LEARNING_RATE,
-    "lr_max": MAX_LEARNING_RATE,
-    "warmup_steps": WARMUP_ITERS,
-    "decay_steps": DECAY_ITERS,
-    "weight_decay": WEIGHT_DECAY,
-    "beta1": BETA_1,
-    "beta2": BETA_2,
-    "epsilon": EPSILON
-}
+adamw_opt_params = dict()
+adamw_opt_params.setdefault("weight_decay", WEIGHT_DECAY)
+adamw_opt_params.setdefault("beta1", BETA_1)
+adamw_opt_params.setdefault("beta2", BETA_2)
+adamw_opt_params.setdefault("epsilon", EPSILON)
+
+muon_opt_params = dict()
+muon_opt_params.setdefault("lr_min", MIN_LEARNING_RATE)
+muon_opt_params.setdefault("lr_max", MAX_LEARNING_RATE)
+muon_opt_params.setdefault("warmup_steps", WARMUP_ITERS)
+muon_opt_params.setdefault("decay_steps", DECAY_ITERS)
+muon_opt_params.setdefault("weight_decay", WEIGHT_DECAY)
+muon_opt_params.setdefault("beta1", BETA_1)
+muon_opt_params.setdefault("beta2", BETA_2)
+muon_opt_params.setdefault("epsilon", EPSILON)
 
 opt_params = dict(
     adamw=adamw_opt_params,
     muon=muon_opt_params
 )
+
+plt_config = {
+    "text.usetex": True,
+    "text.latex.preamble": r"\usepackage{amsmath}\usepackage{amssymb}",
+    "font.family": "serif",
+    "font.serif": "Computer Modern",
+    "savefig.bbox": "tight",
+    "savefig.format": "pdf"
+}
+
+from matplotlib import pyplot as plt
+plt.style.use(plt_config)
+
+pt = 1./72.27
+golden = (1 + 5 ** 0.5) / 2
+
+width = 337.33545 * pt
+height = width / golden

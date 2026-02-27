@@ -16,8 +16,8 @@ OptFloat = Optional[float]
 Nus2 = Tuple[float, float]
 
 # Type Literals
-Devices = Literal["cpu", "cuda", "mps", "xpu"]
-TokenizerSources = Literal["tiktoken", "bytelevelbpe", "rustbpe", "huggingface", "dummy"]
+Devices = Literal["cpu", "cuda", "mps", "xpu", "meta"]
+TokenizerSources = Literal["tiktoken", "local", "huggingface", "dummy"]
 TokenizerTensors = Literal["pt", "np", "tf", "jax"]
 NormalizationTypes = Literal["rms", "layer"]
 AttnImplTypes = Literal["sdpa", "fused", "torch", "raw"] # raw = return attention weights^^

@@ -56,6 +56,7 @@ def bpe(
 
     vocab = Counter()
     pair_counts = Counter()
+    merges: Dict[bytes, int] = {}
 
     print("First streaming pass (initial vocab + pair counts)")
 
@@ -70,8 +71,6 @@ def bpe(
 
     print(f"Initial vocab symbols: {initial_vocab_size}")
     print(f"Will perform ~{nb_merges} merges")
-
-    merges: Dict[bytes, int] = {}
 
     for merge_rank in tqdm(range(nb_merges), desc="BPE Merges"):
         if not pair_counts:
@@ -98,7 +97,6 @@ def bpe(
                 else:
                     syms.append(bytes(token_bytes[i:i+1]))
                     i += 1
-
             new_pair_counts.update(zip(syms, syms[1:]))
 
         pair_counts = new_pair_counts
@@ -167,7 +165,7 @@ def bpe_fast(corpus_iter_fn, corpus_path, config):
     pair_locs = defaultdict(list)
 
     pretknzr = SimplePreTokenizer(config)
-    for head in tqdm(iter_word_nodes(corpus_iter_fn, corpus_path, pretknzr), desc="Building initial pair stats", total=1e10):
+    for head in tqdm(iter_word_nodes(corpus_iter_fn, corpus_path, pretknzr), desc="Building initial pair stats", total=config.max_chars // 10_000):
         all_words.append(head)
         for node in collect_pairs(head):
             pair = (node.sym, node.next.sym)

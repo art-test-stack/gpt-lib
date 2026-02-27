@@ -1,4 +1,4 @@
-import re
+import regex as re
 
 def clean_code_parrot_hook(ds):
     def clean_code_parrot(example):
@@ -24,15 +24,21 @@ def clean_copyright(text):
     text = re.sub(r'© \d{4} .+', '', text)
     return text
 
+_LICENSE_REGEX = re.compile(
+    r"(?is)(licensed under .*?license.*?\n)",
+)
+
 def clean_license(text):
-    license_patterns = [
-        r'Licensed under the Apache License, Version 2.0 \(the "License"\); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0',
-        r'This file is licensed under the MIT License.',
-        r'This code is licensed under the GNU General Public License v3.0.',
-    ]
-    for pattern in license_patterns:
-        text = re.sub(pattern, '', text)
-    return text
+    # license_patterns = [
+    #     r'Licensed under the Apache License, Version 2.0 \(the "License"\); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0',
+    #     r'This file is licensed under the MIT License.',
+    #     r'This code is licensed under the GNU General Public License v3.0.',
+    # ]
+    # for pattern in license_patterns:
+    #     text = re.sub(pattern, '', text)
+    # return text
+    text = _LICENSE_REGEX.sub("", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 def clean_encoding_header(text):
     encoding_headers = [
@@ -53,6 +59,8 @@ def clean_encoding_header(text):
 def clean_loop(text):
     previous_text = None
     while text != previous_text:
+        if text == "":
+            break
         previous_text = text
         text = clean_encoding_header(text)
         text = clean_copyright(text)

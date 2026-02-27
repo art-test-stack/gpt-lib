@@ -4,11 +4,9 @@ from datasets import load_dataset_builder
 from typing import Tuple
 from pathlib import Path
 
-from gpt_lib.utils.default import CACHE_DIR, RANDOM_SEED
-from gpt_lib.data.config import DownloadConfig
+from gpt_lib.utils.default import CACHE_DIR, DATA_DIR, RANDOM_SEED
+from gpt_lib.utils.schemas import DownloadConfig
 
-DATA_PATH = CACHE_DIR / ".data"
-DATA_PATH.mkdir(parents=True, exist_ok=True)
 
 make_url = lambda file_rep, file_name: f"https://huggingface.co/datasets/{file_rep}/resolve/main/{file_name}"
 
@@ -21,9 +19,9 @@ def make_file_config(address) -> Tuple[str]:
     return file_base, file_name
 
 
-def download_single_parquet(file_address: str, config) -> bool:
+def download_single_parquet(file_address: str, config: DownloadConfig) -> bool:
     file_base, file_name = make_file_config(file_address)
-    file_path = DATA_PATH / file_base / file_name
+    file_path: Path = config.data_dir / file_base / file_name
     print(f"Downloading {file_name} to {file_path}...")
     if file_path.exists():
         print(f"{file_name} already exists. Skipping download.")
@@ -60,20 +58,15 @@ def download_single_parquet(file_address: str, config) -> bool:
 def download_parquets(ds_name: str, config: DownloadConfig):
     ds_builder = load_dataset_builder(ds_name, cache_dir=config.data_dir)
 
-    # shards = [ "/".join(f.split("/")[5:]) for f in files.get("train", []) ]
     shards = list(set(ds_builder.config.data_files.get("train", [])))
-
     max_shards = min(len(shards), config.max_shards) if len(shards) > 0 else config.max_shards
 
-    
     if max_shards < len(shards):
         shards = random.sample(shards, k=max_shards)
 
     # TODO: move download single parquet outside function to avoid redefinition error
     with Pool(processes=config.num_workers) as pool:
-
         results = pool.starmap(download_single_parquet, [(shard, config) for shard in shards])
-    
     
     successful_downloads = sum(1 for res in results if res)
     print(f"Downloaded {successful_downloads} out of {config.max_shards} shards successfully.")

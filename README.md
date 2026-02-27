@@ -93,6 +93,18 @@ This project has been developed and tested with Python 3.12. To manage dependenc
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation.
 
+## Usage
+
+### Tokenizer
+
+The tokenizer training script is located in `scripts/train_tokenizer.py`. It allows you to train a BPE tokenizer on a custom corpus, using different implementations (tiktoken, HuggingFace, or custom BPE implementations). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+
+Training time benchmarks for different implementations and configurations. All the tokenizers were trained on corpus generated from `gpt_lib.tokenizer.corpus.TokenizerCorpus()` with default settings, tuned with variable `vocab_size`.
+
+Implementation | Vocabulary size | Num proc | Corpus size | Training time
+--- | --- | --- | --- | ---
+huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds <!-- | 0.27 -->
+
 
 ### Training a model
 

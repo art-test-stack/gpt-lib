@@ -3,15 +3,15 @@ from gpt_lib.utils.import_utils import is_flash_attn3_available_from_kernel
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
-from typing import Any, List, Literal, Optional, get_args
+from typing import Any, Dict, List, Literal, Optional, Union, get_args
 from pathlib import Path
-import json
-import pickle
+import os, time
+import json, pickle
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import warnings
 
 from gpt_lib.utils.default import (
+    DATA_DIR,
     DEVICE,
     MODELS_FOLDER, 
     VOCAB_SIZE, 
@@ -30,6 +30,7 @@ from gpt_lib.utils.default import (
     PRETRAINING_VAL_RATIO,
     PAT_STR_GPT2,
     PAT_STR_GPT4,
+    TOKENIZERS_FOLDER,
     adamw_opt_params,
     opt_params
 )
@@ -69,7 +70,7 @@ class ParallelismConfig(BaseModel):
 
     mode: TpModes = "dp"
     world_size: int
-    tp_size: int = 1
+    dp_size: int = 1
     dp_size: int = 1
 
     tp_size: int = 1
@@ -96,34 +97,157 @@ class ParallelismConfig(BaseModel):
         return self.n_heads_kv // self.tp_size
 
 class TokenizerConfig(BaseModel):
+    model_config = ConfigDict(
+        json_encoders={Path: str},
+    )
     name: str = "ic1_tok"
-    dirname: Path = MODELS_FOLDER
+    dirname: Union[str, Path] = TOKENIZERS_FOLDER
+    dircorpus: Optional[Union[str, Path, Dict[str, Union[str, Path]]]] = None
     vocab_size: int = VOCAB_SIZE
-    max_context: Optional[int] = MAX_CONTEXT
-    pat_str: Optional[str] = PAT_STR_GPT2
+    pat_str: str = PAT_STR_GPT4
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
     def model_post_init(self, context: Any) -> None:
-        self.dirname = self.dirname / self.name
+        if isinstance(self.dirname, str):
+            self.dirname = Path(self.dirname)
+        if not self.dirname.name == self.name:
+            self.dirname = self.dirname / self.name
+        if self.dircorpus is not None and isinstance(self.dircorpus, str):
+            self.dircorpus = Path(self.dircorpus) 
         if not self.dirname.exists():
             self.dirname.mkdir(parents=True, exist_ok=True)
 
     def get_mergeable_ranks(self) -> dict:
         if not self.dirname.exists():
             raise FileNotFoundError(f"Tokenizer directory {self.dirname} does not exist.")
-        mergeable_ranks_path = self.dirname / "mergeable_ranks.pkl"
+        mergeable_ranks_path = self.dirname / "vocab.pkl"
         if not mergeable_ranks_path.exists():
             raise FileNotFoundError(f"Mergeable ranks file {mergeable_ranks_path} does not exist.")
         with open(mergeable_ranks_path, "rb") as f:
             mergeable_ranks = pickle.load(f)
-        assert len(mergeable_ranks) == self.vocab_size, "Mergeable ranks size does not match vocab size."
+        print(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
+        assert len(mergeable_ranks) + len(self.special_tokens) == self.vocab_size, "Mergeable ranks size does not match vocab size."
         return mergeable_ranks
+    
+    @classmethod
+    def from_directory(cls, name, cachedir: Optional[Union[str, Path]] = None) -> "TokenizerConfig":
+        if cachedir is None:
+            cachedir = TOKENIZERS_FOLDER
+        if isinstance(cachedir, str):
+            cachedir = Path(cachedir)
+        path = cachedir / name / "config.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"No such tokenizer config file: {path}")
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data
+    
+    def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
+        if directory is not None:
+            if isinstance(directory, str):
+                directory = Path(directory)
+        else:
+            directory = self.dirname
+        if not directory.name == self.name:
+            directory = directory / self.name
+        config_path = directory / "config.pkl"
+        if not config_path.parent.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(config_path), "wb") as f:
+            pickle.dump(self, f)
 
-class TrainingTokenizerConfig(TokenizerConfig):
-    max_chars: int = 10_000_000_000
-    chars_per_doc: int = 10_000
-    merges_per_pass: int = 512
+
+class TokenizerTrainerConfig(TokenizerConfig):
+    model_config = ConfigDict(
+        json_encoders={Path: str},
+    )
+    max_chars: int = -1
+    chars_per_doc: int = -1
+    merges_per_pass: int = 512 # Only used for fbpe
+    num_proc: int = -1
+    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "tiktoken"
+    
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        if self.trainer == "tiktoken" and self.pat_str == "":
+            warnings.warn("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. Consider using a regex pattern for better tokenization performance.")
+        
+        if self.max_chars == -1:
+            self.max_chars = int(self.vocab_size * 1000 * 2.5) # ~3.5 characters per token on average, adjust as needed based on your corpus
+        if self.chars_per_doc == -1:
+            self.chars_per_doc = self.max_chars // 1000 # Default to 1000 documents if not specified, adjust as needed
+        if self.num_proc <= 0:
+            self.num_proc = min(32, (os.cpu_count() or 1) - 1) # Use all available CPUs minus one for training, adjust as needed
+    
+    def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
+        if directory is not None:
+            if isinstance(directory, str):
+                directory = Path(directory)
+        else:
+            directory = self.dirname
+        config_path = directory / "config.pkl"
+        if not config_path.parent.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(config_path), "wb") as f:
+            pickle.dump(self, f)
+
+        # TODO: consider saving with an other tool
+        json_path = TOKENIZERS_FOLDER / "tokenizers.json"
+        # df = df[df["name"] != self.name]  # Remove existing entry if it exists
+
+        new_row = {
+            "datetime": time.time(),
+            "name": self.name,
+            "vocab_size": self.vocab_size,
+            "special_tokens": len(self.special_tokens.list()),
+            "source": self.source,
+            "trainer": self.trainer,
+            "directory": str(directory),
+            "corpus_files": self.dircorpus if isinstance(self.dircorpus, str) else str(self.dircorpus),
+            "chars_per_doc": self.chars_per_doc,
+            "corpus_nb_chars": self.max_chars,
+        }
+        if json_path.exists():
+            with open(json_path, "r") as f:
+                data = json.load(f)
+        else:
+            data = []
+        data.append(new_row)
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        
+
+class DatasetConfig(BaseModel):
+    name: str
+    source: str
+    split: Literal["train", "validation", "test"]
+    seed: Optional[int]
+    shard_size: Optional[int]
+    num_shards: Optional[int]
+    data_dir: Optional[Union[str,Path]] = DATA_DIR
+    num_proc: Optional[int]
+    stream: bool = True
+
+class BaseConfig(BaseModel):
+    data_dir: Union[str, Path] = DATA_DIR
+
+    def model_post_init(self, context: Any) -> None:
+        if isinstance(self.data_dir, str):
+            self.data_dir = Path(self.data_dir)
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+
+class DownloadConfig(BaseConfig):
+    max_retries: int = 5
+    retry_delay: int = 5  # in seconds
+    num_workers: int = 4
+    max_shards: int = 1000
+
+class DatasetConfig(BaseModel):
+    name: str
+    # tokenizer: callable | None
+    split: str = "train"
 
 class TransformerConfig(BaseModel):
     # model_config = ConfigDict(frozen=True)
@@ -131,9 +255,6 @@ class TransformerConfig(BaseModel):
 
     vocab_size: int = VOCAB_SIZE
     max_context: int = MAX_CONTEXT
-    pad_id: int = -100
-    bos_id: int = -100
-    eos_id: int = -100
 
     positional_encoding: PositionalEncodingTypes = "rope" # Options: "positional", "rope"
 
@@ -149,13 +270,13 @@ class TransformerConfig(BaseModel):
     d_head: int = DIM_HEAD  # dim_model // num_heads
     tie_word_embeddings: bool = True # TODO: implement it in model
 
-    dropout: float = DROPOUT
+    dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
 
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
     norm_eps: float = 1e-8
-    act_func: str = "gelu" # TODO: make it compatible with model.Transformer implementation
+    act_func: str = "swiglu" # TODO: make it compatible with model.Transformer implementation
 
     # TODO: padged attention implementation
     attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
@@ -168,7 +289,6 @@ class TransformerConfig(BaseModel):
     # Based on: https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py
     window_pattern: str = "SSSL" # Can only be composed of 'L' and 'S' characters
     window_size: Optional[int] = None  # Size of short windows
-    max_window_size: Optional[int] = None  # Maximum size of short windows (for dynamic window sizing)
     _window_sizes: List[tuple[int, int]] = PrivateAttr(default_factory=list) # TODO later: make it dynamic
 
     softcap: float = 18.0
@@ -272,14 +392,15 @@ class OptimizerSpec(BaseModel):
 
 class TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
-    batch_size: int = BATCH_SIZE
-    steps: int = 100000
+    batch_size: int = BATCH_SIZE # TODO: decide whether batch_size = B or B x T
+    steps: int = 100_000 # TODO: decide whether step = #forward pass or #tokens seen by model
     accumulation_steps: int = 100
 
     batch_size_scheduling: bool = False
-    max_learning_rate: float = MAX_LEARNING_RATE
-    min_learning_rate: float = MIN_LEARNING_RATE
-    warmup_iters: int = WARMUP_ITERS
+    max_learning_rate: Optional[float] = None # MAX_LEARNING_RATE
+    min_learning_rate: Optional[float] = None # MIN_LEARNING_RATE
+    bs_warmup_iters: Optional[int] = None
+    lr_warmup_iters: int = WARMUP_ITERS
 
     optimizer: dict[str, OptimizerSpec] | OptimizerSpec | OptimizerNames | None = None # { "emb": Optimizer(...), "tf": Optimizer(...) } or single Optimizer or "opt_name" 
     _optimizers: dict[str, OptimizerSpec] = PrivateAttr(default_factory=dict)
@@ -328,7 +449,7 @@ class TrainingConfig(BaseModel):
         opt.setdefault("head", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
         opt.setdefault("w_x0", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
         opt.setdefault("w_res", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-        opt.setdefault("ve", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
+        # opt.setdefault("ve", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
 
         self._optimizers = opt
     
@@ -337,6 +458,8 @@ class TrainingConfig(BaseModel):
             raise ValueError(f"No optimizer specified for part '{part}'. Available parts: {list(self._optimizers.keys())}.")
         return self._optimizers[part].optimizer_class()
     
+
+
 
 class GPTConfig(BaseModel):
     """
@@ -354,7 +477,8 @@ class GPTConfig(BaseModel):
 
     ## Methods:
         to_file(mode="json" | "pickle"): Save the configuration to a file in the specified format.
-        from_file(model_name: str, model_dir: str | Path): Load the
+        from_file(model_name: str, model_dir: str | Path): Load the model configuration from a file.
+        auto_init(auto_config: AutoGPTConfig): Automatically initialize a GPTConfig based on an AutoGPTConfig, inferring missing parameters.
     """
     model_config = ConfigDict(
         json_encoders={Path: str},
@@ -365,14 +489,15 @@ class GPTConfig(BaseModel):
     dirname: str | Path = MODELS_FOLDER
     model: TransformerConfig = Field(default_factory=TransformerConfig)
     loss: LossConfig = Field(default_factory=LossConfig)
-    trainer: TrainingConfig = Field(default_factory=TrainingConfig)
+    # trainer: Optional[TrainingConfig] = Field(default_factory=Optional)
     dtype: Dtypes = "bfloat16"
     device: Devices = DEVICE
 
     def model_post_init(self, context: Any) -> None:
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
-        self.dirname = self.dirname / self.name
+        if not self.dirname.name == self.name:
+            self.dirname = self.dirname / self.name
         if not self.dirname.exists():
             self.dirname.mkdir(parents=True, exist_ok=True)
 
@@ -386,12 +511,7 @@ class GPTConfig(BaseModel):
             
         if not hasattr(self.model, "max_context"):
             raise ValueError("Model configuration must have a max_context attribute.")
-        if not hasattr(self.tokenizer, "max_context"):
-            raise ValueError("Tokenizer configuration must have a max_context attribute.")
-        if hasattr(self.model, "max_context") and hasattr(self.tokenizer, "max_context"):
-            if self.model.max_context != self.tokenizer.max_context:
-                raise ValueError(f"Model max_context ({self.model.max_context}) does not match tokenizer max_context ({self.tokenizer.max_context})")
-            
+        
         self.dtype = getattr(torch, self.dtype)
         self.device = torch.device(self.device)
 
@@ -443,6 +563,7 @@ class GPTConfig(BaseModel):
             config_dict = yaml.safe_load(f)
         return cls.model_validate(config_dict)
     
+
 class TransformerOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -463,8 +584,10 @@ class TrainingState(BaseModel):
     step: int = 0
     best_val_loss: float = float("inf")
     early_stopping_counter: int = 0
-    train_losses: List[float] = Field(default_factory=list)
-    val_losses: List[float] = Field(default_factory=list)
+    loss_train: List[float] = Field(default_factory=list)
+    loss_val: List[float] = Field(default_factory=list)
+    metrics_train: List[dict] = Field(default_factory=list)
+
 
 class TrainingResults(BaseModel):
     train_loss: List[float] = Field(default_factory=list)
@@ -483,7 +606,22 @@ class TrainingMetrics(BaseModel):
     best_val_loss: List[float] = Field(default_factory=list)
     core: List[float] = Field(default_factory=list)
 
+    def append(self, state: TrainingState, elapsed_time: float, tokens_processed: int, accuracy: float, val_accuracy: float, core_usage: float) -> None:
+        self.time.append(elapsed_time)
+        self.step.append(state.step)
+        self.tokens.append(tokens_processed)
+        self.epochs.append(len(state.train_losses))
+        self.accuracy.append(accuracy)
+        self.loss.append(state.train_losses[-1] if state.train_losses else float('nan'))
+        self.val_accuracy.append(val_accuracy)
+        self.val_loss.append(state.val_losses[-1] if state.val_losses else float('nan'))
+        self.best_val_loss.append(state.best_val_loss)
+        self.core.append(core_usage)
+
+
+# This is dummy
 def get_config_from_huggingface(model_name: str) -> TransformerConfig:
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     vocab_size = tokenizer.vocab_size

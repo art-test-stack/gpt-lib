@@ -49,13 +49,9 @@ class TestSelfAttentionMask:
         attn_mask = self.mask_generator(input_ids, mask_pad_token=False, to_bool=False, is_causal=True)
         
         assert attn_mask is None, "Attention mask should be None when mask_pad_token is False."
-        # assert attn_mask.shape == (1, 1, self.max_context, self.max_context), "Attention mask has incorrect shape."
-        # assert attn_mask.shape == self.expected_mask.shape, "Attention mask shape does not match expected shape."
-        # assert torch.equal(attn_mask, self.expected_mask), "Attention mask does not match expected mask for no padding case."
-
+ 
     @pytest.mark.fast
     def test_self_attention_mask_with_padding(self):
-
         input_ids = torch.arange(1, self.max_context - 2).tolist() + [self.pad_idx] * 3
         input_ids = torch.tensor(input_ids).unsqueeze(0)
 

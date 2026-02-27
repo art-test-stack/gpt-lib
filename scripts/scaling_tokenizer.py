@@ -1,0 +1,191 @@
+if not __name__ == "__main__":
+    raise ImportError("This script is intended to be run as a standalone program.")
+
+from gpt_lib.tokenizer.tokenizer import Tokenizer
+from gpt_lib.utils.schemas import TokenizerTrainerConfig
+from gpt_lib.tokenizer.corpus import TokenizerCorpus
+from gpt_lib.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
+
+from pathlib import Path
+import argparse, pickle, zipfile
+import time
+from tqdm import tqdm
+from collections import Counter
+
+import regex as re
+
+parser = argparse.ArgumentParser(description="Find the optimal corpus size for training a BPE tokenizer with different vocabulary sizes, and evaluate the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, vocabulary size, training time, and tokenization quality.")
+parser.add_argument("--write-corpus", action="store_true", help="Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations.")
+args = parser.parse_args()
+
+results_path = Path(args.results_path)
+results_path.parent.mkdir(parents=True, exist_ok=True)
+# Initiate test set and evaluation functions
+def enwik8_path():
+    base_dir = DATA_DIR
+    # download and unzip enwik8 to cache directory
+    enwik8_url = "https://mattmahoney.net/dc/enwik8.zip"
+    enwik8_local_path = base_dir.joinpath("enwik8")
+    enwik8_local_path_zip = base_dir.joinpath("enwik8.zip")
+    if not enwik8_local_path.exists():
+        print(f"Downloading enwik8 to {enwik8_local_path_zip}")
+        import requests
+        response = requests.get(enwik8_url)
+        with open(enwik8_local_path_zip, "wb") as f:
+            f.write(response.content)
+        with zipfile.ZipFile(enwik8_local_path_zip, "r") as zip_ref:
+            zip_ref.extractall(base_dir)
+        print(f"Unzipped enwik8 to {enwik8_local_path}")
+        enwik8_local_path_zip.unlink()
+        print(f"Removed {enwik8_local_path_zip}")
+    else:
+        print(f"Using existing enwik8 at {enwik8_local_path}")
+    return enwik8_local_path
+
+enwik8_path = enwik8_path()
+
+def enwik8_loader():
+    with open(enwik8_path, "r", encoding="utf-8") as f:
+        return f.read(10**7)
+
+def eval_tokenizer(tokenizer):
+    enwiki = enwik8_loader()
+    metrics = dict()
+    counter = Counter()
+    len_tokens = 0
+    len_chars = 0
+    for i, text in enumerate(enwiki.split("\n")):
+        if not text.strip():
+            continue
+        tokens = tokenizer.encode(text)
+        counter.update(tokens)
+        len_tokens += len(tokens)
+        len_chars += len(text)
+        decoded = tokenizer.decode(tokens)
+        acc = decoded == text
+        compression_ratio = len(tokens) / len(text) if len(text) > 0 else 0
+        char_by_token = [len(tokenizer.decode([tok])) for tok in tokens]
+        char_by_token_avg = sum(char_by_token) / len(char_by_token) if len(char_by_token) > 0 else 0
+        for key, value in [
+            ("accuracy", acc), 
+            ("compression_ratio", compression_ratio),
+            ("char_by_token_avg", char_by_token_avg)
+            ]:
+            if key not in metrics:
+                metrics[key] = []
+            metrics[key].append(value)
+    res = {key: sum(values) / len(values) for key, values in metrics.items()}
+    res["len_tokens"] = len_tokens
+    res["len_chars"] = len_chars
+    res["token_counter"] = counter
+    return res
+
+def store_results(result, path=results_path):
+    try:
+        with open(path, "rb") as f:
+            results = pickle.load(f)
+    except FileNotFoundError:
+        results = []
+    results.append(result)
+    with open(path, "wb") as f:
+        pickle.dump(results, f)
+    results = []
+
+
+# Baselines: gpt2, cl100k_base, o200k_base
+from tiktoken import get_encoding
+
+baselines = ["gpt2", "cl100k_base", "o200k_base"]
+for baseline in baselines:
+    enc = get_encoding(baseline)
+    metrics = eval_tokenizer(enc)
+    result = dict(
+        vocab_size=enc.n_vocab,
+        pattern=baseline,
+        max_chars=None,
+        config=None,
+        training_time=None,
+        corpus_size_mb=None,
+        metrics=metrics,
+        baseline=baseline,
+    )
+    store_results(result)
+
+# Corpus size varying with different vocab_sizes and split patterns
+patterns = { "gpt2": PAT_STR_GPT2, "gpt4": PAT_STR_GPT4, "punct": PAT_STR_punct, "cl100k_base": PAT_STR_cl100k_base, "o200k_base": PAT_STR_o200k_base }
+# patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
+# TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
+vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 50_000] 
+# vocab_sizes = list(reversed(vocab_sizes))
+_max_char_runs = 10
+max_chars = lambda vocab_size: [int(vocab_size * i * 500) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
+char_per_doc = lambda max_char: max_char // 1000 # Default to 1000 documents if not specified, adjust as needed
+# Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
+# name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
+name = "ic1-scaling-tok"
+import os
+num_procs = min(os.cpu_count(), 32) 
+print(f"Using {num_procs} processes for tokenizer training.")
+corpus_path = Path(".data/scaling_corpus.txt")
+results = []
+nb_of_runs = len(vocab_sizes) * len(patterns) * _max_char_runs
+corpus_charmax = max(max_chars(max(vocab_sizes)))
+if args.write_corpus:
+    corpus = TokenizerCorpus.write_from_sources(
+        corpus_dir=corpus_path,
+        sources=None,
+        chars_per_doc=corpus_charmax // 10_000,
+        max_chars=corpus_charmax,
+        random_seed=args.seed
+    )
+else:
+    corpus = TokenizerCorpus.from_path(corpus_path)
+
+# based on preliminary tests, we can estimate that each tokenizer training run takes approximately 20 seconds for 10k vocab size and 5M characters. We can use this as a baseline to estimate the total time for all runs and provide feedback to the user.
+t_total_start = time.time()
+run = 0
+for vocab_size in vocab_sizes:
+    print(f"Training tokenizer with vocab size {vocab_size:,}...")
+    for p_str_name, p_str in patterns.items():
+        _max_chars = max_chars(vocab_size)
+        for max_char in tqdm(_max_chars, desc=f"Vocab size {vocab_size:,} for pattern {p_str_name}... Runs {run}-{run+len(_max_chars)}/{nb_of_runs}. Time elapsed: {(time.time() - t_total_start)/3600:.2f} hours."):
+            config = TokenizerTrainerConfig(
+                max_chars=max_char,
+                chars_per_doc=char_per_doc(max_char),
+                vocab_size=vocab_size,
+                name=name,
+                num_proc=num_procs, 
+                trainer="huggingface",
+                dircorpus=corpus_path,
+                pat_str=p_str
+            )
+            t0 = time.time()
+            tokenizer = Tokenizer.train_from_iterator(
+                text_iterator=corpus.iterator(max_chars=max_char),
+                config=config
+            )
+            t1 = time.time()
+
+            result = dict()
+            result["vocab_size"] = vocab_size
+            result["pattern"] = p_str_name
+            result["max_chars"] = max_char
+            result["config"] = str(config)
+            result["training_time"] = t1 - t0
+            result["corpus_size_mb"] = corpus_path.stat().st_size / 1e6
+            for text in corpus.iterator(max_chars=max_char):
+                result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
+                result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
+                result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
+                result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(tokenizer.encode(text, num_threads=num_procs))
+            
+            result["metrics"] = eval_tokenizer(tokenizer)
+            store_results(result)
+            result = dict()
+            del tokenizer
+            run += 1
+print(f"Total time for all runs: {(time.time() - t_total_start)/3600:.2f} hours.")
+
+
