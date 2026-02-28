@@ -299,14 +299,10 @@ def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     mp.set_start_method("spawn", force=True)
-
     max_workers = min(os.cpu_count(), 8)  # be conservative
-
     results = []
-
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(run_tokenizer_experiment, task) for task in tasks]
-
         for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments"):
             results.append(future.result())
 
