@@ -129,6 +129,7 @@ def eval_tokenizer(tokenizer):
         len_tokens = 0
         len_chars = 0
         corpus = eval_set["corpus"].iterator()
+        t0 = time.time()
         for text in corpus:
             if not text.strip():
                 continue
@@ -153,10 +154,12 @@ def eval_tokenizer(tokenizer):
                 if key not in metrics:
                     metrics[key] = []
                 metrics[key].append(value)
+        t1 = time.time()
         res = {key: sum(values) / len(values) for key, values in metrics.items()}
         res["nb_tokens"] = len_tokens
         res["nb_chars"] = len_chars
         res["token_counter"] = counter
+        res["eval_time"] = t1 - t0
         results[eval_set["metricname"]] = res
     return results
 
@@ -197,7 +200,7 @@ patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_st
 vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
 
 # vocab_sizes = list(reversed(vocab_sizes))
-_max_char_runs = 5
+_max_char_runs = 8
 max_chars = lambda vocab_size: [int(vocab_size * i * 500) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
 char_per_doc = lambda max_char: max_char // 1000 # Default to 1000 documents if not specified, adjust as needed
 # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
@@ -216,48 +219,106 @@ corpus = TokenizerCorpus.from_sources(
     random_seed=args.seed
 )
 
+# Prepare run configurations
+tasks = []
+
+for vocab_size in vocab_sizes:
+    for p_str_name, p_str in patterns.items():
+        for max_char in max_chars(vocab_size):
+            tasks.append((vocab_size, p_str_name, p_str, max_char))
+
+def run_tokenizer_experiment(task):
+    vocab_size, p_str_name, p_str, max_char = task
+    config = TokenizerTrainerConfig(
+        max_chars=max_char,
+        chars_per_doc=char_per_doc(max_char),
+        vocab_size=vocab_size,
+        name=name,
+        num_proc=num_procs,
+        trainer="huggingface",
+        dircorpus=corpus_path,
+        pat_str=p_str
+    )
+    t0 = time.time()
+    tokenizer = Tokenizer.train_from_iterator(
+        text_iterator=corpus.iterator(max_chars=max_char),
+        config=config
+    )
+    t1 = time.time()
+
+    result = {
+        "vocab_size": vocab_size,
+        "pattern": p_str_name,
+        "max_chars": max_char,
+        "config": str(config),
+        "training_time": t1 - t0,
+        "corpus_size_mb": corpus_path.stat().st_size / 1e6,
+    }
+
+    for text in corpus.iterator(max_chars=max_char):
+        result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
+        result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
+        result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
+        result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(
+            tokenizer.encode(text, num_threads=num_procs)
+        )
+
+    result["evaluation"] = eval_tokenizer(tokenizer)
+
+    del tokenizer
+    return result
+
 t_total_start = time.time()
 run = 0
-for vocab_size in vocab_sizes:
-    print(f"Training tokenizer with vocab size {vocab_size:,}...")
-    for p_str_name, p_str in patterns.items():
-        _max_chars = max_chars(vocab_size)
-        for max_char in tqdm(_max_chars, desc=f"Vocab size {vocab_size:,} for pattern {p_str_name}... Runs {run}-{run+len(_max_chars)}/{nb_of_runs}. Time elapsed: {(time.time() - t_total_start)/3600:.2f} hours."):
-            config = TokenizerTrainerConfig(
-                max_chars=max_char,
-                chars_per_doc=char_per_doc(max_char),
-                vocab_size=vocab_size,
-                name=name,
-                num_proc=num_procs, 
-                trainer="huggingface",
-                dircorpus=corpus_path,
-                pat_str=p_str
-            )
-            t0 = time.time()
-            tokenizer = Tokenizer.train_from_iterator(
-                text_iterator=corpus.iterator(max_chars=max_char),
-                config=config
-            )
-            t1 = time.time()
+from joblib import Parallel, delayed
 
-            result = dict()
-            result["vocab_size"] = vocab_size
-            result["pattern"] = p_str_name
-            result["max_chars"] = max_char
-            result["config"] = str(config)
-            result["training_time"] = t1 - t0
-            result["corpus_size_mb"] = corpus_path.stat().st_size / 1e6
-            for text in corpus.iterator(max_chars=max_char):
-                result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
-                result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
-                result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
-                result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(tokenizer.encode(text, num_threads=num_procs))
+results = Parallel(n_jobs=-1)(
+    delayed(run_tokenizer_experiment)(task) for task in tasks
+)
+
+for result in results:
+    store_results(result)
+
+# for vocab_size in vocab_sizes:
+#     print(f"Training tokenizer with vocab size {vocab_size:,}...")
+#     for p_str_name, p_str in patterns.items():
+#         _max_chars = max_chars(vocab_size)
+#         for max_char in tqdm(_max_chars, desc=f"Vocab size {vocab_size:,} for pattern {p_str_name}... Runs {run}-{run+len(_max_chars)}/{nb_of_runs}. Time elapsed: {(time.time() - t_total_start)/3600:.2f} hours."):
+#             config = TokenizerTrainerConfig(
+#                 max_chars=max_char,
+#                 chars_per_doc=char_per_doc(max_char),
+#                 vocab_size=vocab_size,
+#                 name=name,
+#                 num_proc=num_procs, 
+#                 trainer="huggingface",
+#                 dircorpus=corpus_path,
+#                 pat_str=p_str
+#             )
+#             t0 = time.time()
+#             tokenizer = Tokenizer.train_from_iterator(
+#                 text_iterator=corpus.iterator(max_chars=max_char),
+#                 config=config
+#             )
+#             t1 = time.time()
+
+#             result = dict()
+#             result["vocab_size"] = vocab_size
+#             result["pattern"] = p_str_name
+#             result["max_chars"] = max_char
+#             result["config"] = str(config)
+#             result["training_time"] = t1 - t0
+#             result["corpus_size_mb"] = corpus_path.stat().st_size / 1e6
+#             for text in corpus.iterator(max_chars=max_char):
+#                 result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
+#                 result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
+#                 result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
+#                 result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(tokenizer.encode(text))
             
-            result["evaluation"] = eval_tokenizer(tokenizer)
-            store_results(result)
-            result = dict()
-            del tokenizer
-            run += 1
+#             result["evaluation"] = eval_tokenizer(tokenizer)
+#             store_results(result)
+#             result = dict()
+#             del tokenizer
+#             run += 1
 print(f"Total time for all runs: {(time.time() - t_total_start)/3600:.2f} hours.")
 
 
