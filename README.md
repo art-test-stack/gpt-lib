@@ -13,7 +13,7 @@
     <img src="rsc/logo.jpg" alt="Logo" height="350">
   </a> -->
 
-<h3 align="center">Generative Pre-trained Transformer Library</h3>
+<h3 align="center">Generative Pre-trained DenseTransformer Library</h3>
 
   <p align="center">
     This project is the implementation of a light-weight library for LLM management and monitoring, from training to inference. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotly.
@@ -48,7 +48,7 @@
 * Positional embedding
   - Absolute
   - rotary
-* Transformer
+* DenseTransformer
   - Attention mechanism
   - Multihead attention
   - flash attention
